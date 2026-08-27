@@ -3,6 +3,9 @@
     "name": "SafeSpreadVIO",
     "slug": "SafeSpreadVIO",
     "version": "1.0.0",
+    "platforms": [
+      "ios"
+    ],
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
@@ -11,25 +14,17 @@
       "bundleIdentifier": "com.safespread.vio",
       "infoPlist": {
         "NSCameraUsageDescription": "SafeSpreadVIO uses the camera for visual-inertial position tracking.",
-        "NSBluetoothAlwaysUsageDescription": "SafeSpreadVIO connects to the SafeSpread rover over Bluetooth."
+        "NSBluetoothAlwaysUsageDescription": "SafeSpreadVIO connects to the SafeSpread rover over Bluetooth.",
+        "UIRequiredDeviceCapabilities": [
+          "arkit"
+        ]
       }
-    },
-    "android": {
-      "adaptiveIcon": {
-        "backgroundColor": "#E6F4FE",
-        "foregroundImage": "./assets/android-icon-foreground.png",
-        "backgroundImage": "./assets/android-icon-background.png",
-        "monochromeImage": "./assets/android-icon-monochrome.png"
-      },
-      "predictiveBackGestureEnabled": false
-    },
-    "web": {
-      "favicon": "./assets/favicon.png"
     },
     "plugins": [
       "expo-dev-client",
       "expo-audio",
-      "expo-sharing"
+      "expo-sharing",
+      "expo-asset"
     ]
   }
 }

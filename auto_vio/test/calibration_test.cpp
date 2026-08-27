@@ -47,34 +47,80 @@ int main() {
   assert(!fitSteeringCalibration(shortSweep, 1, 1709, rejected));
 
   const SpeedCalibrationSample forwardSpeed[] = {
-      {1610, 0.90f, 4.0f, +1},
-      {1630, 1.10f, 4.2f, +1},
-      {1620, 1.00f, 4.1f, +1},
+      {1680, 0.40f, 4.0f, +1},
+      {1740, 0.80f, 4.2f, +1},
+      {1840, 1.40f, 4.1f, +1},
   };
   const SpeedCalibrationSample reverseSpeed[] = {
-      {1390, -0.90f, 4.0f, -1},
-      {1370, -1.10f, 4.2f, -1},
-      {1380, -1.00f, 4.1f, -1},
+      {1300, -0.40f, 4.0f, -1},
+      {1240, -0.90f, 4.2f, -1},
+      {1180, -1.40f, 4.1f, -1},
   };
   float forwardFeedForward = 0.0f, reverseFeedForward = 0.0f;
   assert(fitSpeedFeedForward(forwardSpeed, 3, +1, 1500, forwardFeedForward));
   assert(fitSpeedFeedForward(reverseSpeed, 3, -1, 1500, reverseFeedForward));
-  assert(std::fabs(forwardFeedForward - 120.0f) < 0.001f);
-  assert(std::fabs(reverseFeedForward - 120.0f) < 0.001f);
+  assert(std::fabs(forwardFeedForward - 273.3333f) < 0.001f);
+  assert(std::fabs(reverseFeedForward - 272.0f) < 0.001f);
 
-  SpeedCalibrationSample wrongSign[] = {{1620, -1.0f, 4.0f, +1}};
-  assert(!fitSpeedFeedForward(wrongSign, 1, +1, 1500, forwardFeedForward));
+  SpeedCalibrationSample wrongSign[] = {
+      {1680, -0.5f, 4.0f, +1},
+      {1760, 1.0f, 4.0f, +1},
+      {1840, 1.5f, 4.0f, +1},
+  };
+  assert(!fitSpeedFeedForward(wrongSign, 3, +1, 1500, forwardFeedForward));
+
+  SpeedCalibrationSample allTooSlow[] = {
+      {1680, 0.3f, 4.0f, +1},
+      {1760, 0.5f, 4.0f, +1},
+      {1840, 0.8f, 4.0f, +1},
+  };
+  assert(!fitSpeedFeedForward(allTooSlow, 3, +1, 1500, forwardFeedForward));
+  SpeedCalibrationSample nonMonotonic[] = {
+      {1680, 0.7f, 4.0f, +1},
+      {1760, 1.4f, 4.0f, +1},
+      {1840, 0.9f, 4.0f, +1},
+  };
+  assert(!fitSpeedFeedForward(nonMonotonic, 3, +1, 1500, forwardFeedForward));
+
+  int nextOffset = 0;
+  assert(nextSpeedCalibrationOffset(nullptr, 0, +1, 1500, 0, nextOffset));
+  assert(nextOffset == DEFAULT_SPEED_CALIBRATION_OFFSET_US);
+  assert(nextSpeedCalibrationOffset(nullptr, 0, +1, 1500, 230, nextOffset));
+  assert(nextOffset == 240);  // never retry a pulse already proved too weak
+
+  const SpeedCalibrationSample oneSlow[] = {{1680, 0.40f, 4.0f, +1}};
+  assert(nextSpeedCalibrationOffset(oneSlow, 1, +1, 1500, 0, nextOffset));
+  assert(nextOffset == 228);
+  const SpeedCalibrationSample oneFast[] = {{1800, 1.50f, 4.0f, +1}};
+  assert(nextSpeedCalibrationOffset(oneFast, 1, +1, 1500, 200, nextOffset));
+  assert(nextOffset == 250);
+  const SpeedCalibrationSample bracket[] = {
+      {1700, 0.60f, 4.0f, +1},
+      {1780, 1.40f, 4.0f, +1},
+  };
+  assert(nextSpeedCalibrationOffset(bracket, 2, +1, 1500, 0, nextOffset));
+  assert(nextOffset == 240);
+  const SpeedCalibrationSample atCeiling[] = {{1850, 0.50f, 4.0f, +1}};
+  assert(!nextSpeedCalibrationOffset(atCeiling, 1, +1, 1500, 0, nextOffset));
+  const SpeedCalibrationSample selectorWrongSign[] = {{1680, -0.50f, 4.0f, +1}};
+  assert(!nextSpeedCalibrationOffset(selectorWrongSign, 1, +1, 1500, 0,
+                                     nextOffset));
 
   CompactMotionCalibration compact = makeCompactCalibration(
-      1, 0x4321, 0x89abcdef, steering, 120.0f, 125.0f, true);
+      1, 0x4321, 0x89abcdef, steering, 273.3333f, 272.0f, true);
   assert(compactCalibrationValid(compact));
+  assert(compact.formatVersion == COMPACT_CALIBRATION_FORMAT_VERSION);
   assert(calibrationIdentityMatches(compact, 1, 0x4321, 0x89abcdef));
   assert(!calibrationIdentityMatches(compact, 1, 0x4322, 0x89abcdef));
   compact.forwardFeedForwardUs += 1.0f;
   assert(!compactCalibrationValid(compact));
 
   compact = makeCompactCalibration(1, 0x4321, 0x89abcdef,
-                                   steering, 120.0f, 125.0f, true);
+                                   steering, 273.3333f, 272.0f, true);
+  CompactMotionCalibration legacyFormat = compact;
+  legacyFormat.formatVersion = 1;
+  legacyFormat.checksum = calibrationChecksum(legacyFormat);
+  assert(!compactCalibrationValid(legacyFormat));
   MemoryStore store;
   MotionCalibrationPersistence<MemoryStore> persistence(store);
   assert(persistence.save(compact));

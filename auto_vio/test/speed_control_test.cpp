@@ -46,11 +46,15 @@ int main() {
   assert(first > 120 && second > first);
   assert(std::fabs(breakaway.integralUs) < 0.001f);
 
-  // One second without motion faults and returns neutral offset. Further
-  // calls cannot wind throttle until an explicit reset.
+  // The controller uses the same two-second verification window as the ESC
+  // direction state. This gives a loaded rover time to reach the bounded
+  // breakaway ceiling, then faults to neutral if pavement motion never starts.
   SpeedPI noMotion;
   noMotion.feedForwardUs = 120.0f;
-  for (int index = 0; index < 5; ++index) noMotion.update(1.0f, 0.0f, 0.2f);
+  for (int index = 0; index < 9; ++index) noMotion.update(1.0f, 0.0f, 0.2f);
+  assert(!noMotion.stalled);
+  assert(noMotion.lastOffsetUs >= 320);
+  noMotion.update(1.0f, 0.0f, 0.2f);
   assert(noMotion.stalled);
   assert(noMotion.lastOffsetUs == 0);
   const float frozenIntegral = noMotion.integralUs;
@@ -58,6 +62,28 @@ int main() {
   assert(noMotion.integralUs == frozenIntegral);
   noMotion.reset();
   assert(!noMotion.stalled && noMotion.lastOffsetUs == 0);
+
+  // Coasting in the opposite direction during a reversal is not progress and
+  // cannot clear the no-motion timer or suppress breakaway.
+  SpeedPI oppositeMotion;
+  oppositeMotion.feedForwardUs = 120.0f;
+  for (int index = 0; index < 10; ++index) {
+    oppositeMotion.update(-1.0f, 0.2f, 0.2f);
+  }
+  assert(oppositeMotion.stalled);
+
+  // Corrupt persisted/configured feed-forward is never passed to lround() or
+  // the ESC. It is an explicit calibration fault signal with neutral output.
+  SpeedPI invalidConfiguration;
+  invalidConfiguration.feedForwardUs = 351.0f;
+  assert(invalidConfiguration.update(1.0f, 0.0f, 0.1f) == 0);
+  assert(invalidConfiguration.configurationInvalid);
+  invalidConfiguration.feedForwardUs = 39.0f;
+  assert(invalidConfiguration.update(1.0f, 0.0f, 0.1f) == 0);
+  assert(invalidConfiguration.configurationInvalid);
+  invalidConfiguration.feedForwardUs = 200.0f;
+  assert(invalidConfiguration.update(1.0f, 0.0f, 0.1f) > 0);
+  assert(!invalidConfiguration.configurationInvalid);
 
   // Invalid timing samples are ignored without modifying controller state.
   SpeedPI badDt;

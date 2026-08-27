@@ -15,7 +15,7 @@ const metadata: MissionMetadata = {
   epoch: 7,
   calibrationId: 3,
   calibrationSchemaVersion: 1,
-  pavement: { surface: 'concrete', condition: 'dry' },
+  pavement: { surface: 'concrete', condition: 'dry', operatingLoadLb: 42.5 },
   rectangle: { source: 'entered', mFt: 20, nFt: 8, side: 'right' },
 };
 

@@ -5,6 +5,7 @@ import {
   AckV2,
   buildCommandV2,
   FaultSampleV2,
+  HARDENED_FIRMWARE_CAPABILITY_ID,
   parseAckV2,
   parseFaultSampleV2,
   parseTelemetryV2,
@@ -17,6 +18,26 @@ const DEVICE_NAME = 'SafeSpread';
 const NUS_SERVICE_UUID = '6E400001-B5A3-F393-E0A9-E50E24DCCA9E';
 const NUS_WRITE_UUID = '6E400002-B5A3-F393-E0A9-E50E24DCCA9E';
 const NUS_NOTIFY_UUID = '6E400003-B5A3-F393-E0A9-E50E24DCCA9E';
+export const BLE_SCAN_TIMEOUT_MS = 15000;
+export const BLE_CONNECT_TIMEOUT_MS = 15000;
+
+const V2_NOTIFICATION_LENGTHS = new Map([
+  [0x41, 16], // ACK
+  [0x42, 32], // frozen fault sample
+  [0x54, 32], // telemetry
+]);
+
+/** Firmware text warnings intentionally begin with `!!`. Treat a notification
+ * as binary only when the complete v2 envelope identifies a known packet. */
+export function isProtocolV2Notification(bytes: Uint8Array): boolean {
+  if (bytes.length < 3 || bytes[0] !== 0x21 || bytes[2] !== 2) return false;
+  return V2_NOTIFICATION_LENGTHS.get(bytes[1]) === bytes.length;
+}
+
+export function isHardenedFirmwareProbe(ack: AckV2): boolean {
+  return ack.state === 0 && ack.faultCode === 0 &&
+    ack.calibrationId === HARDENED_FIRMWARE_CAPABILITY_ID;
+}
 
 export type ConnectionStatus = 'disconnected' | 'scanning' | 'connected' | 'incompatible';
 
@@ -48,16 +69,28 @@ export class SafeSpreadBLE implements PoseTransport, MissionTransport {
     return new Promise((resolve, reject) => {
       let finished = false;
       let found = false;
+      let scanTimer: ReturnType<typeof setTimeout> | null = null;
       const isCurrent = () => generation === this.connectionGeneration;
       const finish = (error?: unknown) => {
         if (finished) return;
         finished = true;
+        if (scanTimer) clearTimeout(scanTimer);
+        scanTimer = null;
         if (this.cancelConnect === cancel) this.cancelConnect = null;
         if (error === undefined) resolve();
         else reject(error);
       };
-      const cancel = () => finish(new Error('BLE connection cancelled'));
+      const cancel = () => {
+        this.manager.stopDeviceScan();
+        finish(new Error('BLE connection cancelled'));
+      };
       this.cancelConnect = cancel;
+      scanTimer = setTimeout(() => {
+        if (finished || found || !isCurrent()) return;
+        this.manager.stopDeviceScan();
+        onStatusChange('disconnected');
+        finish(new Error('SafeSpread rover was not found within 15 seconds'));
+      }, BLE_SCAN_TIMEOUT_MS);
       this.manager.startDeviceScan([NUS_SERVICE_UUID], null, async (error, scanned) => {
         if (finished || found || !isCurrent()) return;
         if (error) {
@@ -69,8 +102,20 @@ export class SafeSpreadBLE implements PoseTransport, MissionTransport {
         if (scanned?.name !== DEVICE_NAME) return;
 
         found = true;
+        if (scanTimer) clearTimeout(scanTimer);
         this.manager.stopDeviceScan();
         let device: Device | null = null;
+        scanTimer = setTimeout(() => {
+          if (finished || !isCurrent()) return;
+          onStatusChange('disconnected');
+          finish(new Error('SafeSpread rover connection timed out after discovery'));
+          this.notificationSubscription?.remove();
+          this.notificationSubscription = null;
+          this.disconnectSubscription?.remove();
+          this.disconnectSubscription = null;
+          if (this.device === device) this.device = null;
+          void (device ?? scanned).cancelConnection().catch(() => {});
+        }, BLE_CONNECT_TIMEOUT_MS);
         try {
           device = await scanned.connect();
           if (!isCurrent() || finished) {
@@ -98,7 +143,11 @@ export class SafeSpreadBLE implements PoseTransport, MissionTransport {
           );
           this.disconnectSubscription = device.onDisconnected(() => {
             if (!isCurrent() || this.device !== device) return;
+            this.notificationSubscription?.remove();
+            this.notificationSubscription = null;
+            this.disconnectSubscription = null;
             this.device = null;
+            this.pendingText = '';
             onStatusChange('disconnected');
             for (const listener of this.disconnectListeners) listener();
           });
@@ -131,7 +180,12 @@ export class SafeSpreadBLE implements PoseTransport, MissionTransport {
             await device?.cancelConnection().catch(() => {});
             return;
           }
+          this.notificationSubscription?.remove();
+          this.notificationSubscription = null;
+          this.disconnectSubscription?.remove();
+          this.disconnectSubscription = null;
           this.device = null;
+          await device?.cancelConnection().catch(() => {});
           onStatusChange('disconnected');
           finish(connectionError);
         }
@@ -148,6 +202,7 @@ export class SafeSpreadBLE implements PoseTransport, MissionTransport {
     this.notificationSubscription = null;
     this.disconnectSubscription?.remove();
     this.disconnectSubscription = null;
+    this.pendingText = '';
     const connected = this.device;
     this.device = null;
     if (connected) await connected.cancelConnection();
@@ -214,7 +269,14 @@ export class SafeSpreadBLE implements PoseTransport, MissionTransport {
     });
     try {
       await this.writeWithResponse(packet);
-      return await acknowledgement;
+      const result = await acknowledgement;
+      if (!isHardenedFirmwareProbe(result)) {
+        throw new Error(
+          `SafeSpread firmware is not the required hardened build ` +
+          `(capability ${result.calibrationId}, expected ${HARDENED_FIRMWARE_CAPABILITY_ID})`,
+        );
+      }
+      return result;
     } finally {
       if (timer) clearTimeout(timer);
       unsubscribe();
@@ -259,7 +321,7 @@ export class SafeSpreadBLE implements PoseTransport, MissionTransport {
   }
 
   private handleNotification(bytes: Uint8Array): void {
-    if (bytes[0] === 0x21) {
+    if (isProtocolV2Notification(bytes)) {
       const ack = parseAckV2(bytes);
       if (ack) {
         for (const listener of this.ackListeners) listener(bytes.slice());

@@ -35,6 +35,11 @@ struct RoutePoint {
 
 const float ROUTE_STEP_FT = 0.5f;
 
+// Give the loaded rover enough dry, straight travel to verify that commanded
+// forward motion agrees with measured motion before it reaches the pavement
+// boundary and spraying can begin.
+constexpr float INITIAL_RUN_IN_FT = 1.0f;
+
 // advanceRouteIndex searches no more than this many points per control update.
 // Telemetry/replay can therefore detect a backward index or a forward jump the
 // production tracker itself could not have produced in one accepted sample.
@@ -141,6 +146,32 @@ inline int emitLineTo(RoutePoint *out, int maxOut, float x1, float y1,
     n++;
   }
   return n;
+}
+
+/** Emit the shared dry staging approach for every route style. Dry samples
+ *  stop short of the boundary and the first point at y=0 enables spray. The
+ *  runtime still gates that command on the measured pose crossing y=0, since
+ *  nearest-point tracking can select a boundary waypoint slightly early. */
+inline int emitInitialRunIn(RoutePoint *out, int maxOut) {
+  if (maxOut <= 0) return 0;
+
+  int count = 0;
+  out[count] = {0.0f, -INITIAL_RUN_IN_FT, false, false, false, false};
+  count++;
+  for (float distance = ROUTE_STEP_FT;
+       distance < INITIAL_RUN_IN_FT && count < maxOut;
+       distance += ROUTE_STEP_FT) {
+    out[count] = {
+      0.0f, -INITIAL_RUN_IN_FT + distance,
+      false, false, false, false
+    };
+    count++;
+  }
+  if (count >= maxOut) return count;
+
+  out[count] = {0.0f, 0.0f, true, false, false, false};
+  count++;
+  return count;
 }
 
 /** Points along a headland turn, transformed from the maneuver's own frame
@@ -262,7 +293,12 @@ inline int buildForwardOnlyRoute(float fieldPassFt, float fieldWidthFt,
       order, MAX_FORWARD_LANES);
   if (orderCount != totalLanes) return 0;
 
-  int count = 0;
+  int count = emitInitialRunIn(out, maxOut);
+  if (count <= 0 || !out[count - 1].spray ||
+      fabsf(out[count - 1].x) > 1e-4f ||
+      fabsf(out[count - 1].y) > 1e-4f) {
+    return count;
+  }
   int completedLanes = 0;
   bool haveExit = false;
   float exitX = 0.0f, exitY = 0.0f, exitHeading = 0.0f;
@@ -304,8 +340,12 @@ inline int buildForwardOnlyRoute(float fieldPassFt, float fieldWidthFt,
     }
 
     if (count >= maxOut) break;
-    out[count] = {laneX, startY, true, false, false, false};
-    count++;
+    // The shared run-in already emitted the first lane's sprayed boundary
+    // point. Later lanes still need their own explicit dry-to-spray handoff.
+    if (visit > 0) {
+      out[count] = {laneX, startY, true, false, false, false};
+      count++;
+    }
     count += emitLineTo(out + count, maxOut - count,
                         laneX, startY, laneX, endY, true, false);
     if (count <= 0 || fabsf(out[count - 1].x - laneX) > 1e-4f ||
@@ -346,13 +386,14 @@ inline int buildRoute(float fieldPassFt, float fieldWidthFt,
   float planLeft  = rLeftFt * TURN_PLANNING_MARGIN;
   float planRight = rRightFt * TURN_PLANNING_MARGIN;
 
-  // The route starts under the rover, spraying: the first pass runs straight
-  // ahead from where it was placed, and it is the pass the whole mission is
-  // lined up on.
-  int n = 0;
-  out[n].x = 0.0f; out[n].y = 0.0f; out[n].spray = true;
-  out[n].reverse = false; out[n].turning = false; out[n].terminal = false;
-  n++;
+  // Start one foot before the rectangle and remain dry until the first pass
+  // begins at its y=0 boundary. This gives direction verification real travel
+  // before any application is possible.
+  int n = emitInitialRunIn(out, maxOut);
+  if (n <= 0 || !out[n - 1].spray || fabsf(out[n - 1].x) > 1e-4f ||
+      fabsf(out[n - 1].y) > 1e-4f) {
+    return n;
+  }
   int completedLanes = 0;
 
   for (int i = 0; i < lanes && n < maxOut; i++) {
@@ -363,9 +404,9 @@ inline int buildRoute(float fieldPassFt, float fieldWidthFt,
     float dir    = goesUp ? 1.0f : -1.0f;
     float headingDeg = goesUp ? 0.0f : 180.0f;
 
-    // Run in from the headland so the rover is straight and on the line
-    // before any spray comes out. The first pass has no run-in: the rover is
-    // already sitting at its start, which is how it gets aimed.
+    // Later passes run in from the headland so the rover is straight and on
+    // the line before any spray comes out. The first pass uses the shared
+    // one-foot mission run-in emitted above.
     if (i > 0) {
       n += emitLineTo(out + n, maxOut - n,
                       laneX, startY - dir * HEADLAND_MARGIN_FT,

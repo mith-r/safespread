@@ -131,7 +131,7 @@ describe('setupReducer', () => {
       { type: 'REQUEST_ARM' },
     );
     expect(state.phase).toBe('readiness');
-    expect(state.validationError).toMatch(/corner A/i);
+    expect(state.validationError).toMatch(/staging.*boundary A/i);
   });
 
   it('rejects invalid dimensions and negative headland before leaving rectangle setup', () => {
@@ -194,6 +194,29 @@ describe('setupReducer', () => {
       atStart: false,
     });
     expect(updated.validationError).toBe(invalid.validationError);
+  });
+
+  it('returns incomplete setup to Connection when BLE drops and clears stale readiness', () => {
+    const disconnected = setupReducer(enteredReadyState(), {
+      type: 'CONNECTION_CHANGED',
+      status: 'disconnected',
+      compatible: false,
+    });
+    expect(disconnected.phase).toBe('connection');
+    expect(disconnected.compatible).toBe(false);
+    expect(disconnected.loggingReady).toBe(false);
+    expect(disconnected.readiness).toEqual({
+      trackingNormal: false,
+      poseStable: false,
+      atStart: false,
+    });
+    expect(disconnected.rectangle).not.toBeNull();
+  });
+
+  it('does not let a delayed mode action change a mission after calibration setup', () => {
+    const state = setupReducer(enteredReadyState(), { type: 'SET_WET_MODE', wet: true });
+    expect(state.wet).toBe(false);
+    expect(state.validationError).toMatch(/only change/i);
   });
 
   it.each(['missing', 'stale'] as const)(

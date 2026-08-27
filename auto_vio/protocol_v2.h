@@ -10,6 +10,10 @@ namespace protocol_v2 {
 
 constexpr uint8_t VERSION = 2;
 constexpr uint8_t MAGIC = 0x21;
+// Returned in the calibrationId field of the epoch-zero STOP probe ACK. This
+// distinguishes the hardened firmware from older protocol-v2 sketches that
+// share packet framing but not the required dry-motion and calibration gates.
+constexpr uint16_t HARDENED_FIRMWARE_CAPABILITY_ID = 0x0202;
 constexpr size_t POSE_SIZE = 32;
 constexpr size_t RECTANGLE_SIZE = 32;
 constexpr size_t CALIBRATION_SIZE = 24;

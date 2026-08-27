@@ -1,4 +1,4 @@
-import { createCalibration } from './calibration';
+import { createCalibration, markMotionCalibrationVerified } from './calibration';
 import {
   CalibrationStorageAdapter,
   loadCalibration,
@@ -11,7 +11,7 @@ class MemoryStorage implements CalibrationStorageAdapter {
   async write(value: string): Promise<void> { this.value = value; }
 }
 
-const calibration = createCalibration({
+const unverifiedCalibration = createCalibration({
   schemaVersion: 1,
   hardwareTag: 'rover-a',
   createdAtIso: '2026-08-26T16:00:00.000Z',
@@ -20,9 +20,14 @@ const calibration = createCalibration({
   cameraYawDeg: -3,
   sprayForwardFt: -1.1,
   sprayRightFt: 0,
+  operatingLoadLb: 40,
   surface: 'asphalt',
   condition: 'wet',
 });
+const calibration = markMotionCalibrationVerified(
+  unverifiedCalibration,
+  '2026-08-26T16:30:00.000Z',
+);
 
 describe('calibrationStore', () => {
   it('round trips a valid matching calibration', async () => {
@@ -42,6 +47,28 @@ describe('calibrationStore', () => {
       calibration: null,
       wetAllowed: false,
       reason: 'schema',
+    });
+  });
+
+  it('loads phone geometry but remains dry-only until matching firmware motion proof exists', async () => {
+    const storage = new MemoryStorage();
+    await saveCalibration(unverifiedCalibration, 'rover-a', storage);
+    await expect(loadCalibration('rover-a', storage)).resolves.toEqual({
+      calibration: unverifiedCalibration,
+      wetAllowed: false,
+      reason: 'motion',
+    });
+  });
+
+  it('fails old records closed when operating load identity is absent', async () => {
+    const storage = new MemoryStorage();
+    const legacy = { ...calibration } as Partial<typeof calibration>;
+    delete legacy.operatingLoadLb;
+    storage.value = JSON.stringify(legacy);
+    await expect(loadCalibration('rover-a', storage)).resolves.toEqual({
+      calibration: null,
+      wetAllowed: false,
+      reason: 'load',
     });
   });
 

@@ -1,5 +1,6 @@
 const VERSION = 2;
 const MAGIC = 0x21;
+export const HARDENED_FIRMWARE_CAPABILITY_ID = 0x0202;
 
 export interface PoseV2 {
   flags: number;
@@ -170,6 +171,19 @@ export function buildPoseV2(value: PoseV2): Uint8Array {
   view.setInt16(26, saturatedInteger(value.yawRateDps, 100, -32768, 32767, 'yawRateDps'), true);
   view.setUint16(28, uint(value.calibrationId, 0xffff, 'calibrationId'), true);
   return finalizePacket(bytes);
+}
+
+/** Add time spent waiting in the phone's BLE queue to a pose packet's age.
+ * The packet is copied and its CRC is rebuilt so a packet already in flight is
+ * never mutated. */
+export function addPoseQueueAgeV2(bytes: Uint8Array, queueAgeMs: number): Uint8Array {
+  if (!isPacket(bytes, 32, 0x56)) throw new Error('invalid protocol-v2 pose packet');
+  nonnegative(queueAgeMs, 'queueAgeMs');
+  const aged = bytes.slice();
+  const view = viewOf(aged);
+  const currentAgeMs = view.getUint16(10, true);
+  view.setUint16(10, Math.min(0xffff, currentAgeMs + Math.round(queueAgeMs)), true);
+  return finalizePacket(aged);
 }
 
 export function parsePoseV2(bytes: Uint8Array): PoseV2 | null {

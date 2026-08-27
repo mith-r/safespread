@@ -17,6 +17,7 @@ interface RunningMissionProps {
   fault: string | null;
   logName: string | null;
   faultDumpReady: boolean;
+  faultDumpError: string | null;
   busy: boolean;
   onStop(): Promise<void>;
   onDownloadFault(): Promise<void>;
@@ -42,6 +43,7 @@ export default function RunningMission(props: RunningMissionProps) {
         </View>
         <Pressable
           accessibilityRole="button"
+          accessibilityLabel="Emergency stop"
           onPress={() => void props.onStop()}
           style={({ pressed }) => [styles.stop, pressed && styles.pressed]}
         >
@@ -71,19 +73,27 @@ export default function RunningMission(props: RunningMissionProps) {
           <Text style={styles.faultTitle}>Primary fault</Text>
           <Text style={styles.faultText}>{props.fault}</Text>
           <Text style={styles.detail}>Mission log: {props.logName ?? 'unavailable'}</Text>
+          {props.faultDumpError ? <Text style={styles.faultDetail}>{props.faultDumpError}</Text> : null}
           <Pressable
             accessibilityRole="button"
+            accessibilityState={{ disabled: !props.faultDumpReady }}
             disabled={!props.faultDumpReady}
             onPress={() => void props.onDownloadFault()}
             style={({ pressed }) => [styles.download, !props.faultDumpReady && styles.disabled, pressed && styles.pressed]}
           >
-            <Text style={styles.buttonText}>{props.faultDumpReady ? 'Share ESP32 fault buffer' : 'Collecting fault buffer…'}</Text>
+            <Text style={styles.buttonText}>
+              {props.faultDumpReady
+                ? 'Share ESP32 fault buffer'
+                : props.faultDumpError
+                  ? 'ESP32 fault buffer unavailable'
+                  : 'Collecting fault buffer…'}
+            </Text>
           </Pressable>
         </View>
       ) : null}
 
       <View style={styles.bottomRow}>
-        <Pressable onPress={() => setMapOpen(true)} style={({ pressed }) => [styles.mapButton, pressed && styles.pressed]}>
+        <Pressable accessibilityRole="button" onPress={() => setMapOpen(true)} style={({ pressed }) => [styles.mapButton, pressed && styles.pressed]}>
           <Text style={styles.buttonText}>Mission map</Text>
         </Pressable>
         <Text style={styles.logName}>{props.logName ?? 'Mission log unavailable'}</Text>
@@ -113,6 +123,7 @@ const styles = StyleSheet.create({
   faultCard: { backgroundColor: '#3d1010', borderColor: '#ff5252', borderWidth: 1, borderRadius: 10, padding: 14, gap: 8 },
   faultTitle: { color: '#ff8a80', fontSize: 19, fontWeight: '900' },
   faultText: { color: 'white', fontSize: 16, lineHeight: 22 },
+  faultDetail: { color: '#ffccbc', fontSize: 13, lineHeight: 18 },
   download: { backgroundColor: '#455a64', borderRadius: 8, padding: 12, alignItems: 'center' },
   bottomRow: { marginTop: 'auto', gap: 8 },
   mapButton: { backgroundColor: '#1565c0', borderRadius: 8, padding: 13, alignItems: 'center' },

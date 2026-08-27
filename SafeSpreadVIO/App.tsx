@@ -3,7 +3,20 @@ import { File, Paths } from 'expo-file-system';
 import { useKeepAwake } from 'expo-keep-awake';
 import { setAudioModeAsync, useAudioPlayer } from 'expo-audio';
 import { SafeSpreadBLE } from './src/ble';
-import { CalibrationRecord, createCalibration } from './src/calibration';
+import {
+  CalibrationRecord,
+  createCalibration,
+  markMotionCalibrationVerified,
+  motionCalibrationIdFromLog,
+} from './src/calibration';
+import {
+  appendDiagnosticLine,
+  calibrationLineResult,
+  CalibrationOpcode,
+  calibrationStepName,
+  calibrationStepTimeoutMs,
+  selfTestLineResult,
+} from './src/calibrationWorkflow';
 import { loadCalibration, saveCalibration } from './src/calibrationStore';
 import { LatestPoseSender } from './src/latestPoseSender';
 import { MissionControl } from './src/missionControl';
@@ -17,9 +30,13 @@ import {
   MissionRecord,
 } from './src/missionLog';
 import { MAX_PATH_POINTS, PathPoint, shouldRecord } from './src/pathMath';
-import { wrappedHeadingDelta } from './src/poseMath';
-import { buildPoseV2, FaultSampleV2, TelemetryV2 } from './src/protocolV2';
-import { worldToRectangle } from './src/rectangle';
+import {
+  buildPoseV2,
+  FaultSampleV2,
+  parseFaultSampleV2,
+  TelemetryV2,
+} from './src/protocolV2';
+import { isAtInitialStagingPose, worldToRectangle } from './src/rectangle';
 import RunningMission from './src/RunningMission';
 import SetupWizard, { CalibrationFormValue } from './src/SetupWizard';
 import {
@@ -33,9 +50,11 @@ import { DEFAULT_MOUNT_CALIBRATION, useVIOPose } from './src/useVIOPose';
 
 const HARDWARE_TAG = 'safespread-rover-a';
 const APP_VERSION = '1.0.0';
-const FIRMWARE_VERSION = 'protocol-v2-acknowledged';
+const FIRMWARE_VERSION = 'protocol-v2-hardened-0x0202';
 const START_POSITION_TOLERANCE_FT = 0.75;
 const START_HEADING_TOLERANCE_DEG = 5;
+const POST_CONFIG_POSE_TIMEOUT_MS = 1500;
+const SELF_TEST_RESULT_TIMEOUT_MS = 45000;
 const ble = new SafeSpreadBLE();
 
 function faultName(code: number): string {
@@ -67,6 +86,8 @@ export default function App() {
   const setupRef = useRef(setup);
   setupRef.current = setup;
   const [calibration, setCalibration] = useState<CalibrationRecord | null>(null);
+  const calibrationRef = useRef<CalibrationRecord | null>(calibration);
+  calibrationRef.current = calibration;
   const mountCalibration = calibration ?? DEFAULT_MOUNT_CALIBRATION;
   const vio = useVIOPose(mountCalibration);
   const trackingOkRef = useRef(vio.trackingOk);
@@ -80,6 +101,7 @@ export default function App() {
   const [path, setPath] = useState<PathPoint[]>([]);
   const [logName, setLogName] = useState<string | null>(null);
   const [faultDumpUri, setFaultDumpUri] = useState<string | null>(null);
+  const [faultDumpError, setFaultDumpError] = useState<string | null>(null);
 
   const controlRef = useRef<MissionControl | null>(null);
   const senderRef = useRef<LatestPoseSender | null>(null);
@@ -91,21 +113,24 @@ export default function App() {
   const calibrationPreparedRef = useRef(false);
   const resourceWetRef = useRef<boolean | null>(null);
   const lastPoseOfferedSequenceRef = useRef(0);
+  const firstRectanglePoseOfferIdRef = useRef<number | null>(null);
   const poseBySequenceRef = useRef(new Map<number, MissionRecord>());
   const faultPacketsRef = useRef<Uint8Array[]>([]);
   const faultHandledRef = useRef(false);
   const bootFaultSummaryRef = useRef<string | null>(null);
+  const diagnosticModeRef = useRef<'calibration' | 'self-test' | null>(null);
+  const pendingMotionCalibrationProofRef = useRef<string | null>(null);
   const calibrationWaiterRef = useRef<{
     resolve(message: string): void;
     reject(error: Error): void;
-    timer: ReturnType<typeof setTimeout>;
+    hardTimer: ReturnType<typeof setTimeout>;
   } | null>(null);
   const operationGateRef = useRef(new MissionOperationGate());
   const activeOperationSettledRef = useRef<Promise<void> | null>(null);
   const selfTestWaiterRef = useRef<{
     resolve(message: string): void;
     reject(error: Error): void;
-    timer: ReturnType<typeof setTimeout>;
+    hardTimer: ReturnType<typeof setTimeout>;
   } | null>(null);
 
   function refreshLogs() {
@@ -137,13 +162,14 @@ export default function App() {
     operationGateRef.current.cancel();
     const calibrationWaiter = calibrationWaiterRef.current;
     if (calibrationWaiter) {
-      clearTimeout(calibrationWaiter.timer);
+      clearTimeout(calibrationWaiter.hardTimer);
       calibrationWaiterRef.current = null;
+      pendingMotionCalibrationProofRef.current = null;
       calibrationWaiter.resolve('Calibration cancelled by Stop');
     }
     const selfTestWaiter = selfTestWaiterRef.current;
     if (selfTestWaiter) {
-      clearTimeout(selfTestWaiter.timer);
+      clearTimeout(selfTestWaiter.hardTimer);
       selfTestWaiterRef.current = null;
       selfTestWaiter.resolve('Self-test cancelled by Stop');
     }
@@ -181,6 +207,7 @@ export default function App() {
     epochRef.current = null;
     calibrationWireRef.current = null;
     rectangleConfiguredRef.current = false;
+    firstRectanglePoseOfferIdRef.current = null;
     calibrationPreparedRef.current = false;
     resourceWetRef.current = null;
     poseBySequenceRef.current.clear();
@@ -218,6 +245,7 @@ export default function App() {
         pavement: {
           surface: calibration?.surface ?? 'other',
           condition: setup.wet ? 'wet' : 'dry',
+          operatingLoadLb: calibration?.operatingLoadLb ?? null,
         },
         rectangle: {
           source: setup.rectangle.source,
@@ -247,11 +275,13 @@ export default function App() {
     calibrationWireRef.current = wire;
     poseStreamingRef.current = true;
     rectangleConfiguredRef.current = false;
+    firstRectanglePoseOfferIdRef.current = null;
     calibrationPreparedRef.current = false;
     resourceWetRef.current = setup.wet;
     faultHandledRef.current = false;
     faultPacketsRef.current = [];
     setFaultDumpUri(null);
+    setFaultDumpError(null);
     setPath([]);
     return { control, epoch };
   }
@@ -304,11 +334,13 @@ export default function App() {
         }
         setFaultDumpUri(await persistFaultDump(samples, epoch));
       } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
         recordLog({
           type: 'fault_buffer_error',
           phoneMs: Date.now(),
-          fault: error instanceof Error ? error.message : String(error),
+          fault: message,
         });
+        setFaultDumpError(`ESP32 fault buffer unavailable: ${message}`);
       }
     }
     poseStreamingRef.current = false;
@@ -317,6 +349,72 @@ export default function App() {
       setOperationError(error instanceof Error ? error.message : String(error));
     });
     setBusy(false);
+  }
+
+  function settleCalibrationResult(line: string) {
+    const result = calibrationLineResult(line);
+    const waiter = calibrationWaiterRef.current;
+    if (!result || !waiter) return;
+    clearTimeout(waiter.hardTimer);
+    calibrationWaiterRef.current = null;
+    const proofLine = pendingMotionCalibrationProofRef.current;
+    pendingMotionCalibrationProofRef.current = null;
+    if (result === 'success') {
+      if (proofLine) void persistMotionCalibrationProof(proofLine);
+      waiter.resolve(line);
+    } else {
+      waiter.reject(new Error(line));
+    }
+  }
+
+  function settleSelfTestResult(line: string) {
+    const result = selfTestLineResult(line);
+    const waiter = selfTestWaiterRef.current;
+    if (!result || !waiter) return;
+    clearTimeout(waiter.hardTimer);
+    selfTestWaiterRef.current = null;
+    if (result === 'success') waiter.resolve(line);
+    else waiter.reject(new Error(line));
+  }
+
+  async function persistMotionCalibrationProof(line: string) {
+    const completedId = motionCalibrationIdFromLog(line);
+    if (completedId === null) return;
+    const current = calibrationRef.current;
+    if (!current || current.id !== completedId) {
+      dispatch({ type: 'SET_CALIBRATION_STATUS', status: 'stale' });
+      setOperationError(
+        `Rover completed calibration ID ${completedId}, but the phone currently has ` +
+        `${current ? `ID ${current.id}` : 'no saved calibration'}. Save and repeat the loaded calibration.`,
+      );
+      return;
+    }
+    try {
+      const verified = markMotionCalibrationVerified(current, new Date().toISOString());
+      await saveCalibration(verified, HARDWARE_TAG);
+      if (calibrationRef.current?.id !== completedId) return;
+      calibrationRef.current = verified;
+      setCalibration(verified);
+      dispatch({ type: 'SET_CALIBRATION_STATUS', status: 'ready' });
+    } catch (error) {
+      dispatch({ type: 'SET_CALIBRATION_STATUS', status: 'stale' });
+      setOperationError(`Could not save motion-calibration proof: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  function handleFirmwareLog(line: string) {
+    if (line.startsWith('[BOOT FAULT]') || line.startsWith('[FAULT SUMMARY]')) {
+      bootFaultSummaryRef.current = line;
+    }
+    if (diagnosticModeRef.current || line.startsWith('[CAL')) {
+      setCalibrationProgress((previous) => appendDiagnosticLine(previous, line));
+    }
+    settleCalibrationResult(line);
+    settleSelfTestResult(line);
+    if (motionCalibrationIdFromLog(line) !== null && calibrationWaiterRef.current) {
+      pendingMotionCalibrationProofRef.current = line;
+    }
+    recordLog({ type: 'firmware_log', phoneMs: Date.now(), message: line });
   }
 
   useEffect(() => {
@@ -336,6 +434,7 @@ export default function App() {
 
   useEffect(() => {
     void loadCalibration(HARDWARE_TAG).then((result) => {
+      calibrationRef.current = result.calibration;
       setCalibration(result.calibration);
       dispatch({
         type: 'SET_CALIBRATION_STATUS',
@@ -348,8 +447,29 @@ export default function App() {
     refreshLogs();
   }, []);
 
+  async function connectToRover() {
+    setOperationError(null);
+    try {
+      await ble.connect(
+        (status) => dispatch({
+          type: 'CONNECTION_CHANGED',
+          status,
+          compatible: status === 'connected',
+        }),
+        handleFirmwareLog,
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!/connection cancelled/i.test(message)) {
+        setOperationError(`BLE connection failed: ${message}`);
+      }
+    }
+  }
+
   useEffect(() => {
     const removeTelemetry = ble.subscribeTelemetry((next) => {
+      const activeEpoch = epochRef.current;
+      if (activeEpoch === null || next.epoch !== activeEpoch) return;
       telemetryRef.current = next;
       setTelemetry(next);
       const poseRecord = poseBySequenceRef.current.get(next.consumedPoseSequence) ?? {};
@@ -373,6 +493,7 @@ export default function App() {
         droppedPackets: next.droppedPackets,
       });
       if (next.state === 4 && setupRef.current.phase === 'running') {
+        controlRef.current?.notifyComplete();
         dispatch({ type: 'MISSION_COMPLETE' });
         recordLog({ type: 'state', phoneMs: Date.now(), state: 'COMPLETE' });
         poseStreamingRef.current = false;
@@ -383,50 +504,30 @@ export default function App() {
       }
     });
     const removeFaultPackets = ble.subscribeFaultPackets((packet) => {
-      faultPacketsRef.current.push(packet);
+      const sample = parseFaultSampleV2(packet);
+      if (sample && sample.epoch === epochRef.current) faultPacketsRef.current.push(packet);
     });
     const removeDisconnect = ble.subscribeDisconnect(() => {
       controlRef.current?.notifyDisconnect();
       const phase = setupRef.current.phase;
       if (['arming', 'armed', 'starting', 'running'].includes(phase)) {
         void handleMissionFault('BLE disconnected');
+      } else if (phase !== 'fault') {
+        const pendingOperation = cancelActiveMissionOperation();
+        setBusy(true);
+        void (async () => {
+          await pendingOperation;
+          activeOperationSettledRef.current = null;
+          await releaseMissionResources(true);
+          dispatch({ type: 'SET_LOGGING_READY', ready: false });
+          setOperationError('BLE disconnected. Reconnect before continuing setup.');
+          setBusy(false);
+        })();
       }
     });
-    void ble.connect(
-      (status) => dispatch({
-        type: 'CONNECTION_CHANGED',
-        status,
-        compatible: status === 'connected',
-      }),
-      (line) => {
-        if (line.startsWith('[BOOT FAULT]') || line.startsWith('[FAULT SUMMARY]')) {
-          bootFaultSummaryRef.current = line;
-        }
-        if (line.startsWith('[CAL')) {
-          setCalibrationProgress(line);
-          const waiter = calibrationWaiterRef.current;
-          if (waiter && (line.startsWith('[CAL PASS]') || line.startsWith('[CAL SAMPLE]') || line.startsWith('[CAL FAIL]'))) {
-            clearTimeout(waiter.timer);
-            calibrationWaiterRef.current = null;
-            if (line.startsWith('[CAL FAIL]')) waiter.reject(new Error(line));
-            else waiter.resolve(line);
-          }
-        }
-        if (line.startsWith('=== SELF TEST')) {
-          setCalibrationProgress(line);
-          const waiter = selfTestWaiterRef.current;
-          if (waiter && (line.includes('COMPLETE') || line.includes('FAILED') ||
-              line.includes('ABORTED') || line.includes('STOPPED'))) {
-            clearTimeout(waiter.timer);
-            selfTestWaiterRef.current = null;
-            if (line.includes('COMPLETE')) waiter.resolve(line);
-            else waiter.reject(new Error(line));
-          }
-        }
-        recordLog({ type: 'firmware_log', phoneMs: Date.now(), message: line });
-      },
-    ).catch((error) => setOperationError(error instanceof Error ? error.message : String(error)));
+    void connectToRover();
     return () => {
+      cancelActiveMissionOperation();
       removeTelemetry();
       removeFaultPackets();
       removeDisconnect();
@@ -438,9 +539,11 @@ export default function App() {
   const rectanglePose = vio.validatedPose && setup.rectangle
     ? worldToRectangle(vio.validatedPose.rover, setup.rectangle)
     : null;
-  const atStart = Boolean(rectanglePose &&
-    Math.hypot(rectanglePose.x, rectanglePose.y) <= START_POSITION_TOLERANCE_FT &&
-    Math.abs(wrappedHeadingDelta(rectanglePose.heading, 0)) <= START_HEADING_TOLERANCE_DEG);
+  const atStart = isAtInitialStagingPose(
+    rectanglePose,
+    START_POSITION_TOLERANCE_FT,
+    START_HEADING_TOLERANCE_DEG,
+  );
 
   useEffect(() => {
     dispatch({
@@ -459,16 +562,17 @@ export default function App() {
     const rectangle = setupRef.current.rectangle;
     if (!validated || !sender || epoch === null || !wire || !rectangle ||
         !poseStreamingRef.current || !vio.trackingOk) return;
-    const roverPose = rectangleConfiguredRef.current
+    const rectangleFrame = rectangleConfiguredRef.current;
+    const roverPose = rectangleFrame
       ? worldToRectangle(validated.rover, rectangle)
       : validated.rover;
     const ageMs = Math.max(0, validated.captureAgeMs +
       (globalThis.performance?.now() ?? Date.now()) - validated.receivedAtMs);
-    const yawRate = rectangleConfiguredRef.current && rectangle.side === 'left'
+    const yawRate = rectangleFrame && rectangle.side === 'left'
       ? -validated.yawRateDps
       : validated.yawRateDps;
     try {
-      sender.offer(buildPoseV2({
+      const offerId = sender.offer(buildPoseV2({
         flags: 1 | (validated.courseDeg === null ? 0 : 2) | 4,
         epoch,
         sequence: validated.sequence,
@@ -480,6 +584,9 @@ export default function App() {
         yawRateDps: yawRate,
         calibrationId: wire.id,
       }));
+      if (rectangleFrame && firstRectanglePoseOfferIdRef.current === null) {
+        firstRectanglePoseOfferIdRef.current = offerId;
+      }
       lastPoseOfferedSequenceRef.current = validated.sequence;
       const poseRecord: MissionRecord = {
         type: 'pose',
@@ -543,9 +650,13 @@ export default function App() {
         condition: setup.wet ? 'wet' : 'dry',
       });
       await saveCalibration(record, HARDWARE_TAG);
+      calibrationRef.current = record;
       setCalibration(record);
-      dispatch({ type: 'SET_CALIBRATION_STATUS', status: 'ready' });
-      setCalibrationProgress(`Phone calibration ${record.id} saved. Run dry steering, speed, and reverse checks for this ID.`);
+      dispatch({ type: 'SET_CALIBRATION_STATUS', status: 'stale' });
+      setCalibrationProgress(
+        `Phone calibration ID ${record.id} saved. Wet mode remains blocked until the rover ` +
+        'reports that steering, loaded speed, and reverse calibration were saved for this same ID.',
+      );
     } catch (error) {
       setOperationError(error instanceof Error ? error.message : String(error));
       dispatch({ type: 'SET_CALIBRATION_STATUS', status: 'stale' });
@@ -554,13 +665,21 @@ export default function App() {
     }
   }
 
-  function awaitCalibrationResult(): Promise<string> {
+  function awaitCalibrationResult(opcode: CalibrationOpcode): Promise<string> {
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
+      const hardTimer = setTimeout(() => {
         calibrationWaiterRef.current = null;
-        reject(new Error('Calibration result timeout; Stop and inspect rover logs.'));
-      }, 25000);
-      calibrationWaiterRef.current = { resolve, reject, timer };
+        pendingMotionCalibrationProofRef.current = null;
+        reject(new Error(
+          `${calibrationStepName(opcode)} result timeout; the rover was given ` +
+          `${calibrationStepTimeoutMs(opcode) / 1000} seconds. Press Stop and inspect the visible rover transcript.`,
+        ));
+      }, calibrationStepTimeoutMs(opcode));
+      calibrationWaiterRef.current = {
+        resolve,
+        reject,
+        hardTimer,
+      };
     });
   }
 
@@ -568,6 +687,9 @@ export default function App() {
     const operation = beginMissionOperation();
     setBusy(true);
     setOperationError(null);
+    diagnosticModeRef.current = 'calibration';
+    pendingMotionCalibrationProofRef.current = null;
+    setCalibrationProgress(`Starting ${calibrationStepName(opcode)}…`);
     try {
       if (setup.wet) throw new Error('Select Dry diagnostic before any calibration movement.');
       if (!calibration) throw new Error('Save mount and pavement calibration before motion calibration.');
@@ -584,17 +706,24 @@ export default function App() {
         await new Promise((resolve) => setTimeout(resolve, 20));
         operationGateRef.current.assertCurrent(operation.generation);
       }
-      const result = awaitCalibrationResult();
+      operationGateRef.current.assertCurrent(operation.generation);
+      if (lastPoseOfferedSequenceRef.current <= beforeSequence) {
+        throw new Error('No new validated pose reached the rover. Restore normal tracking before moving.');
+      }
+      const result = awaitCalibrationResult(opcode);
       try {
         await control.runCalibrationStep(opcode);
         operationGateRef.current.assertCurrent(operation.generation);
-        setCalibrationProgress(await result);
+        const terminalLine = await result;
+        setCalibrationProgress((previous) => appendDiagnosticLine(previous, terminalLine));
         operationGateRef.current.assertCurrent(operation.generation);
       } catch (error) {
         const waiter = calibrationWaiterRef.current;
         if (waiter) {
-          clearTimeout(waiter.timer);
+          clearTimeout(waiter.hardTimer);
           calibrationWaiterRef.current = null;
+          pendingMotionCalibrationProofRef.current = null;
+          waiter.resolve('Calibration command did not start.');
         }
         throw error;
       }
@@ -603,6 +732,7 @@ export default function App() {
         setOperationError(error instanceof Error ? error.message : String(error));
       }
     } finally {
+      diagnosticModeRef.current = null;
       finishMissionOperation(operation.generation, operation.settle);
     }
   }
@@ -611,6 +741,8 @@ export default function App() {
     const operation = beginMissionOperation();
     setBusy(true);
     setOperationError(null);
+    diagnosticModeRef.current = 'self-test';
+    setCalibrationProgress('Starting dry self-test; the rover will steer and verify both drive directions while physical spray output remains off…');
     try {
       if (setup.wet) throw new Error('Select Dry diagnostic before the self-test.');
       if (!calibration) throw new Error('Save mount and pavement calibration before the self-test.');
@@ -622,22 +754,24 @@ export default function App() {
         calibrationPreparedRef.current = true;
       }
       const result = new Promise<string>((resolve, reject) => {
-        const timer = setTimeout(() => {
+        const hardTimer = setTimeout(() => {
           selfTestWaiterRef.current = null;
           reject(new Error('Self-test result timeout; press Stop and inspect rover logs.'));
-        }, 30000);
-        selfTestWaiterRef.current = { resolve, reject, timer };
+        }, SELF_TEST_RESULT_TIMEOUT_MS);
+        selfTestWaiterRef.current = { resolve, reject, hardTimer };
       });
       try {
         await control.selfTest();
         operationGateRef.current.assertCurrent(operation.generation);
-        setCalibrationProgress(await result);
+        const terminalLine = await result;
+        setCalibrationProgress((previous) => appendDiagnosticLine(previous, terminalLine));
         operationGateRef.current.assertCurrent(operation.generation);
       } catch (error) {
         const waiter = selfTestWaiterRef.current;
         if (waiter) {
-          clearTimeout(waiter.timer);
+          clearTimeout(waiter.hardTimer);
           selfTestWaiterRef.current = null;
+          waiter.resolve('Self-test command did not start.');
         }
         throw error;
       }
@@ -646,6 +780,7 @@ export default function App() {
         setOperationError(error instanceof Error ? error.message : String(error));
       }
     } finally {
+      diagnosticModeRef.current = null;
       finishMissionOperation(operation.generation, operation.settle);
     }
   }
@@ -669,10 +804,29 @@ export default function App() {
       const wire = calibration ?? DEFAULT_MOUNT_CALIBRATION;
       await control.configure(setup.rectangle, wire);
       operationGateRef.current.assertCurrent(operation.generation);
+      firstRectanglePoseOfferIdRef.current = null;
       rectangleConfiguredRef.current = true;
+      const sender = senderRef.current;
+      if (!sender) throw new Error('Pose transport stopped during Configure.');
+      const poseDeadline = Date.now() + POST_CONFIG_POSE_TIMEOUT_MS;
+      let deliveredRectanglePose = false;
+      while (Date.now() < poseDeadline) {
+        operationGateRef.current.assertCurrent(operation.generation);
+        const firstRectangleOffer = firstRectanglePoseOfferIdRef.current;
+        if (firstRectangleOffer !== null && sender.lastSentOfferId >= firstRectangleOffer) {
+          deliveredRectanglePose = true;
+          break;
+        }
+        await new Promise<void>((resolve) => setTimeout(resolve, 25));
+      }
+      if (!deliveredRectanglePose) {
+        throw new Error(
+          'No fresh rectangle-frame pose reached the rover after Configure. Stop, restore normal tracking, and try again.',
+        );
+      }
       const currentReadiness = setupRef.current.readiness;
       if (!trackingOkRef.current || !currentReadiness.poseStable || !currentReadiness.atStart) {
-        throw new Error('Readiness changed during Configure; Stop and return to the rectangle start.');
+        throw new Error('Readiness changed during Configure; Stop and return to staging 1.0 ft before boundary A.');
       }
       await control.arm();
       operationGateRef.current.assertCurrent(operation.generation);
@@ -681,9 +835,10 @@ export default function App() {
     } catch (error) {
       if (!operationGateRef.current.isCurrent(operation.generation)) return;
       const message = error instanceof Error ? error.message : String(error);
-      if (/ACK timeout/i.test(message)) dispatch({ type: 'ACK_TIMEOUT', operation: 'Arm' });
-      else dispatch({ type: 'MISSION_FAULT', cause: message });
-      void handleMissionFault(message);
+      const cause = /ACK timeout/i.test(message)
+        ? 'Arm acknowledgement timeout; the rover was stopped before motion could start.'
+        : message;
+      void handleMissionFault(cause);
     } finally {
       finishMissionOperation(operation.generation, operation.settle);
     }
@@ -704,9 +859,10 @@ export default function App() {
     } catch (error) {
       if (!operationGateRef.current.isCurrent(operation.generation)) return;
       const message = error instanceof Error ? error.message : String(error);
-      if (/ACK timeout/i.test(message)) dispatch({ type: 'ACK_TIMEOUT', operation: 'Start' });
-      else dispatch({ type: 'MISSION_FAULT', cause: message });
-      void handleMissionFault(message);
+      const cause = /ACK timeout/i.test(message)
+        ? 'Start acknowledgement timeout; the rover was stopped.'
+        : message;
+      void handleMissionFault(cause);
     } finally {
       finishMissionOperation(operation.generation, operation.settle);
     }
@@ -719,6 +875,10 @@ export default function App() {
     try {
       if (controlRef.current) await controlRef.current.stop();
       else if (setup.connectionStatus === 'connected') await ble.emergencyStop();
+      else {
+        await ble.disconnect();
+        dispatch({ type: 'CONNECTION_CHANGED', status: 'disconnected', compatible: false });
+      }
       recordLog({ type: 'state', phoneMs: Date.now(), state: 'STOPPED' });
     } catch (error) {
       setOperationError(`Stop acknowledgement failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -769,6 +929,7 @@ export default function App() {
         fault={setup.fault ?? operationError}
         logName={logName}
         faultDumpReady={Boolean(faultDumpUri)}
+        faultDumpError={faultDumpError}
         busy={busy}
         onStop={onStop}
         onDownloadFault={async () => {
@@ -788,7 +949,8 @@ export default function App() {
       calibration={calibration}
       recentLogs={recentLogs}
       busy={busy}
-      calibrationProgress={operationError ?? calibrationProgress}
+      calibrationProgress={calibrationProgress}
+      operationError={operationError}
       dispatch={dispatch}
       onSaveCalibration={onSaveCalibration}
       onRunCalibration={onRunCalibration}
@@ -796,6 +958,7 @@ export default function App() {
       onArm={onArm}
       onStart={onStart}
       onStop={onStop}
+      onReconnect={connectToRover}
       onExport={onExport}
     />
   );

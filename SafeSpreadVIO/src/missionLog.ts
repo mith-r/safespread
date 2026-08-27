@@ -18,6 +18,8 @@ export interface MissionMetadata {
   pavement: {
     surface: 'asphalt' | 'concrete' | 'pavers' | 'other';
     condition: 'dry' | 'wet';
+    /** Tank contents or secured ballast represented by the calibration ID. */
+    operatingLoadLb: number | null;
   };
   rectangle: {
     source: 'entered' | 'walked';

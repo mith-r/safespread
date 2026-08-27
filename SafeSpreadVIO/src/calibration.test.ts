@@ -1,7 +1,11 @@
 import {
+  calibrationDraftMatches,
   CalibrationInput,
   createCalibration,
   fitMountYaw,
+  hasMotionCalibrationProof,
+  markMotionCalibrationVerified,
+  motionCalibrationIdFromLog,
   YawCalibrationSample,
 } from './calibration';
 
@@ -68,6 +72,7 @@ describe('createCalibration', () => {
     cameraYawDeg: 12.34567,
     sprayForwardFt: -1.2,
     sprayRightFt: 0.1,
+    operatingLoadLb: 42.5,
     surface: 'concrete',
     condition: 'dry',
   };
@@ -84,5 +89,44 @@ describe('createCalibration', () => {
     expect(createCalibration(input).id).not.toBe(
       createCalibration({ ...input, sprayForwardFt: -1.1 }).id,
     );
+  });
+
+  it('matches only saved canonical draft values', () => {
+    const calibration = createCalibration(input);
+    const draft = {
+      cameraForwardFt: input.cameraForwardFt,
+      cameraRightFt: input.cameraRightFt,
+      cameraYawDeg: input.cameraYawDeg,
+      sprayForwardFt: input.sprayForwardFt,
+      sprayRightFt: input.sprayRightFt,
+      operatingLoadLb: input.operatingLoadLb,
+      surface: input.surface,
+    };
+    expect(calibrationDraftMatches(calibration, draft)).toBe(true);
+    expect(calibrationDraftMatches(calibration, { ...draft, surface: 'asphalt' })).toBe(false);
+    expect(calibrationDraftMatches(calibration, { ...draft, operatingLoadLb: 43 })).toBe(false);
+    expect(calibrationDraftMatches(calibration, { ...draft, cameraForwardFt: Number.NaN })).toBe(false);
+  });
+
+  it('includes operating load in identity and rejects invalid load values', () => {
+    expect(createCalibration(input).id).not.toBe(
+      createCalibration({ ...input, operatingLoadLb: 50 }).id,
+    );
+    expect(() => createCalibration({ ...input, operatingLoadLb: -1 })).toThrow(/load/i);
+    expect(() => createCalibration({ ...input, operatingLoadLb: Number.NaN })).toThrow(/finite/i);
+  });
+
+  it('records motion proof without changing calibration identity', () => {
+    const calibration = createCalibration(input);
+    expect(hasMotionCalibrationProof(calibration)).toBe(false);
+    const verified = markMotionCalibrationVerified(calibration, '2026-08-27T12:00:00.000Z');
+    expect(verified.id).toBe(calibration.id);
+    expect(hasMotionCalibrationProof(verified)).toBe(true);
+  });
+
+  it('accepts only the exact bounded firmware motion-calibration completion line', () => {
+    expect(motionCalibrationIdFromLog('[CAL PASS] Motion calibration saved for ID 42.')).toBe(42);
+    expect(motionCalibrationIdFromLog('[CAL SAMPLE] throttle=1620')).toBeNull();
+    expect(motionCalibrationIdFromLog('[CAL PASS] Motion calibration saved for ID 70000.')).toBeNull();
   });
 });

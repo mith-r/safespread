@@ -12,6 +12,12 @@ enum DrivePhase : uint8_t {
   D_FAILED = 5,
 };
 
+inline bool driveDirectionChanged(bool directionRequested,
+                                  bool currentReverse,
+                                  bool requestedReverse) {
+  return directionRequested && currentReverse != requestedReverse;
+}
+
 // One ESC direction sequence used everywhere the rover can move. The caller
 // supplies pose samples; this object owns the timing and refuses to call a
 // direction ready until measured displacement agrees with the command.
