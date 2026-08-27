@@ -90,6 +90,17 @@ describe('MissionControl ordering and acknowledgements', () => {
     expect(control.state).toBe('running');
   });
 
+  it('rechecks pose freshness between Arm and Start', async () => {
+    const transport = new FakeTransport();
+    let fresh = true;
+    const control = await configuredControl(transport, () => fresh);
+    transport.onWrite = (packet) => transport.emit(ack(7, packetId(packet), 2));
+    await control.arm();
+    fresh = false;
+    await expect(control.start()).rejects.toThrow(/fresh/i);
+    expect(control.state).toBe('armed');
+  });
+
   it('retries twice with the same command ID and ignores wrong ACKs', async () => {
     const transport = new FakeTransport();
     const control = await configuredControl(transport);
@@ -182,17 +193,66 @@ describe('MissionControl ordering and acknowledgements', () => {
     expect(control.state).toBe('idle');
   });
 
-  it('runs the retained stationary self-test only after the v2 epoch is prepared', async () => {
+  it('waits once for a fault dump that outlives the ordinary ACK timeout', async () => {
     const transport = new FakeTransport();
-    const control = new MissionControl(transport, 7, () => true, { timeoutMs: 5, retries: 0 });
+    const control = new MissionControl(transport, 7, () => false, {
+      timeoutMs: 5,
+      retries: 2,
+      faultDumpTimeoutMs: 60,
+    });
+    transport.onWrite = (packet) => {
+      setTimeout(() => transport.emit(ack(7, packetId(packet), 0, 0)), 20);
+    };
+    await control.dumpFault();
+    expect(transport.writes).toHaveLength(1);
+  });
+
+  it('runs the retained dry motion self-test only with a prepared epoch and fresh pose', async () => {
+    const transport = new FakeTransport();
+    let fresh = false;
+    const control = new MissionControl(transport, 7, () => fresh, { timeoutMs: 5, retries: 0 });
     await expect(control.selfTest()).rejects.toThrow(/prepared/i);
     transport.onWrite = (packet) => transport.emit(ack(7, packetId(packet), 0));
     await control.prepareCalibration(calibration);
+    await expect(control.selfTest()).rejects.toThrow(/fresh/i);
+    fresh = true;
     await control.selfTest();
     expect(transport.writes.map((packet) => [packet[1], packet[3]])).toEqual([
       [0x4b, 0],
       [0x43, 4],
     ]);
+
+    const wet = new MissionControl(new FakeTransport(), 8, () => true, {
+      timeoutMs: 5,
+      retries: 0,
+      dryMode: false,
+    });
+    await expect(wet.selfTest()).rejects.toThrow(/dry/i);
+  });
+
+  it('records firmware completion and does not turn a completed mission into a disconnect fault', async () => {
+    const transport = new FakeTransport();
+    const control = await configuredControl(transport);
+    transport.onWrite = (packet) => transport.emit(ack(7, packetId(packet), 2));
+    await control.arm();
+    transport.onWrite = (packet) => transport.emit(ack(7, packetId(packet), 3));
+    await control.start();
+    control.notifyComplete();
+    control.notifyDisconnect();
+    expect(control.state).toBe('complete');
+  });
+
+  it('cancels an acknowledgement wait immediately when BLE disconnects', async () => {
+    const transport = new FakeTransport();
+    const control = new MissionControl(transport, 7, () => true, {
+      timeoutMs: 1000,
+      retries: 2,
+    });
+    const configuring = control.configure(rectangle, calibration);
+    await Promise.resolve();
+    control.notifyDisconnect();
+    await expect(configuring).rejects.toThrow(/cancelled/i);
+    expect(transport.writes).toHaveLength(1);
   });
 });
 

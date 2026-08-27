@@ -9,11 +9,15 @@ struct SpeedPI {
   static constexpr float PROPORTIONAL_US_PER_FPS = 30.0f;
   static constexpr float INTEGRAL_US_PER_FT = 8.0f;
   static constexpr float MAX_CORRECTION_US = 250.0f;
+  static constexpr float MIN_FEED_FORWARD_US = 40.0f;
   static constexpr float MAX_OFFSET_US = 350.0f;
   static constexpr float BREAKAWAY_RATE_US_PER_SECOND = 100.0f;
-  static constexpr float MAX_BREAKAWAY_US = 100.0f;
+  static constexpr float MAX_BREAKAWAY_US = 200.0f;
   static constexpr float MOTION_THRESHOLD_FPS = 0.05f;
-  static constexpr float NO_MOTION_TIMEOUT_SECONDS = 1.0f;
+  // DirectionState independently requires 0.30 ft within two seconds. Match
+  // that verification window so a loaded rover gets the full bounded
+  // breakaway ramp instead of being faulted halfway through it.
+  static constexpr float NO_MOTION_TIMEOUT_SECONDS = 2.0f;
   static constexpr float MAX_DT_SECONDS = 0.5f;
 
   float feedForwardUs = 120.0f;
@@ -23,6 +27,7 @@ struct SpeedPI {
   float lastCorrectionUs = 0.0f;
   int lastOffsetUs = 0;
   bool stalled = false;
+  bool configurationInvalid = false;
 
   int update(float target, float measured, float dt) {
     if (!std::isfinite(target) || !std::isfinite(measured) ||
@@ -33,6 +38,18 @@ struct SpeedPI {
       lastOffsetUs = 0;
       return 0;
     }
+    if (!std::isfinite(feedForwardUs) ||
+        feedForwardUs < MIN_FEED_FORWARD_US ||
+        feedForwardUs > MAX_OFFSET_US) {
+      configurationInvalid = true;
+      integralUs = 0.0f;
+      breakawayUs = 0.0f;
+      noMotionSeconds = 0.0f;
+      lastCorrectionUs = 0.0f;
+      lastOffsetUs = 0;
+      return 0;
+    }
+    configurationInvalid = false;
     if (std::fabs(target) < 0.01f) {
       integralUs = 0.0f;
       breakawayUs = 0.0f;
@@ -44,7 +61,9 @@ struct SpeedPI {
 
     const float direction = target > 0.0f ? 1.0f : -1.0f;
     const float error = target - measured;
-    const bool moving = std::fabs(measured) >= MOTION_THRESHOLD_FPS;
+    // Opposite-sign motion is not progress and must not clear the no-motion
+    // timer (notably while a loaded rover is still coasting into a reversal).
+    const bool moving = measured * direction >= MOTION_THRESHOLD_FPS;
 
     float candidateIntegral = integralUs;
     if (moving) {
@@ -98,5 +117,6 @@ struct SpeedPI {
     lastCorrectionUs = 0.0f;
     lastOffsetUs = 0;
     stalled = false;
+    configurationInvalid = false;
   }
 };

@@ -1,4 +1,7 @@
-import { normalizeHeading, Pose } from './poseMath';
+import { normalizeHeading, Pose, wrappedHeadingDelta } from './poseMath';
+
+/** Rover staging distance behind boundary A before the mission's initial run-in. */
+export const INITIAL_RUN_IN_FT = 1.0;
 
 export type CoverageSide = 'right' | 'left';
 
@@ -59,11 +62,17 @@ export function defineEnteredRectangle(
   startClearFt: number,
   endClearFt: number,
 ): RectangleDefinition {
-  const originWorld = requirePose(stableRover, 'rover');
+  const stagingWorld = requirePose(stableRover, 'rover');
   if (side !== 'right' && side !== 'left') throw new RangeError('coverage side is invalid');
+  const runIn = axesDeltaToWorld(0, INITIAL_RUN_IN_FT, stagingWorld.heading);
+  const originWorld = {
+    x: stagingWorld.x + runIn.x,
+    y: stagingWorld.y + runIn.y,
+    heading: stagingWorld.heading,
+  };
   return {
     originWorld,
-    mAxisHeadingDeg: originWorld.heading,
+    mAxisHeadingDeg: stagingWorld.heading,
     mFt: requirePositive(mFt, 'M'),
     nFt: requirePositive(nFt, 'N'),
     side,
@@ -71,6 +80,22 @@ export function defineEnteredRectangle(
     endClearFt: requireClearance(endClearFt, 'end clearance'),
     source: 'entered',
   };
+}
+
+export function isAtInitialStagingPose(
+  rectanglePose: Pose | null,
+  positionToleranceFt: number,
+  headingToleranceDeg: number,
+): boolean {
+  if (!rectanglePose || ![rectanglePose.x, rectanglePose.y, rectanglePose.heading].every(Number.isFinite)) {
+    return false;
+  }
+  if (!Number.isFinite(positionToleranceFt) || positionToleranceFt < 0 ||
+      !Number.isFinite(headingToleranceDeg) || headingToleranceDeg < 0) {
+    return false;
+  }
+  return Math.hypot(rectanglePose.x, rectanglePose.y + INITIAL_RUN_IN_FT) <= positionToleranceFt &&
+    Math.abs(wrappedHeadingDelta(rectanglePose.heading, 0)) <= headingToleranceDeg;
 }
 
 export function captureCornerA(stableCamera: Pose, isStable: boolean): CornerA {

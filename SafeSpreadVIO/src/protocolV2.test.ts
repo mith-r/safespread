@@ -1,4 +1,5 @@
 import {
+  addPoseQueueAgeV2,
   AckV2,
   buildCalibrationV2,
   buildCommandV2,
@@ -44,6 +45,14 @@ describe('protocol v2 builders', () => {
       '215602073412040302017d000000c03f000010c000c0b34385ffd711efbeb7e9',
     );
     expect(parsePoseV2(packet)).toEqual(pose);
+  });
+
+  it('adds queued transport time to pose age and rebuilds the CRC', () => {
+    const packet = buildPoseV2(pose);
+    expect(parsePoseV2(addPoseQueueAgeV2(packet, 75))?.ageMs).toBe(pose.ageMs + 75);
+    expect(parsePoseV2(packet)?.ageMs).toBe(pose.ageMs);
+    expect(() => addPoseQueueAgeV2(new Uint8Array(32), 1)).toThrow(/invalid/i);
+    expect(() => addPoseQueueAgeV2(packet, -1)).toThrow(/queueAgeMs/i);
   });
 
   it('saturates only age and signed fixed-point motion fields', () => {

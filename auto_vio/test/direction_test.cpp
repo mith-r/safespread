@@ -37,6 +37,11 @@ static void driveReverseSequence(DirectionState &state) {
 }
 
 int main() {
+  assert(!driveDirectionChanged(false, false, true));
+  assert(!driveDirectionChanged(true, false, false));
+  assert(driveDirectionChanged(true, false, true));
+  assert(driveDirectionChanged(true, true, false));
+
   DirectionState navigation = readyForward();
 
   // A verified reverse change always observes neutral, then the optional

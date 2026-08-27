@@ -154,9 +154,7 @@ function canArm(state: SetupState): string | null {
   if (!state.readiness.trackingNormal) return 'ARKit tracking must be normal before arming.';
   if (!state.readiness.poseStable) return 'Wait for a stable pose before arming.';
   if (!state.readiness.atStart) {
-    return state.rectangleMode === 'walked'
-      ? 'Return the rover to Corner A before arming.'
-      : 'Move the rover to the rectangle start before arming.';
+    return 'Place the rover at staging 1.0 ft before boundary A, facing along M, before arming.';
   }
   if (state.wet && state.calibrationStatus !== 'ready') {
     return 'Wet operation requires a current matching calibration.';
@@ -172,6 +170,18 @@ export function setupReducer(state: SetupState, action: SetupAction): SetupState
 
   switch (action.type) {
     case 'CONNECTION_CHANGED':
+      if (action.status !== 'connected' &&
+          ['rectangle', 'calibration', 'readiness'].includes(state.phase)) {
+        return {
+          ...state,
+          phase: 'connection',
+          connectionStatus: action.status,
+          compatible: false,
+          loggingReady: false,
+          readiness: { ...NOT_READY },
+          validationError: null,
+        };
+      }
       return {
         ...state,
         connectionStatus: action.status,
@@ -258,6 +268,9 @@ export function setupReducer(state: SetupState, action: SetupAction): SetupState
       return { ...state, calibrationStatus: action.status, validationError: null };
 
     case 'SET_WET_MODE':
+      if (state.phase !== 'calibration') {
+        return fail(state, 'Operation mode can only change during calibration setup.');
+      }
       return { ...state, wet: action.wet, validationError: null };
 
     case 'SET_LOGGING_READY':

@@ -2,6 +2,8 @@ import {
   captureCornerA,
   defineEnteredRectangle,
   defineWalkedRectangle,
+  INITIAL_RUN_IN_FT,
+  isAtInitialStagingPose,
   rectangleToWorld,
   worldToRectangle,
 } from './rectangle';
@@ -14,11 +16,10 @@ function expectPoseClose(actual: Pose, expected: Pose) {
 }
 
 describe('entered rectangle', () => {
-  it.each(['right', 'left'] as const)('uses the stable rover pose and explicit %s side', (side) => {
-    const origin = { x: 10, y: -4, heading: 37 };
-    const definition = defineEnteredRectangle(origin, 20, 8, side, 4, 6);
-    expect(definition).toEqual({
-      originWorld: origin,
+  it.each(['right', 'left'] as const)('uses the stable rover pose as the %s-side staging pose', (side) => {
+    const staging = { x: 10, y: -4, heading: 37 };
+    const definition = defineEnteredRectangle(staging, 20, 8, side, 4, 6);
+    expect(definition).toMatchObject({
       mAxisHeadingDeg: 37,
       mFt: 20,
       nFt: 8,
@@ -27,7 +28,13 @@ describe('entered rectangle', () => {
       endClearFt: 6,
       source: 'entered',
     });
-    expectPoseClose(worldToRectangle(origin, definition), { x: 0, y: 0, heading: 0 });
+    expect(definition.originWorld.x).toBeCloseTo(staging.x + Math.sin(37 * Math.PI / 180));
+    expect(definition.originWorld.y).toBeCloseTo(staging.y + Math.cos(37 * Math.PI / 180));
+    expectPoseClose(worldToRectangle(staging, definition), {
+      x: 0,
+      y: -INITIAL_RUN_IN_FT,
+      heading: 0,
+    });
   });
 
   it('round trips an arbitrary world heading for either coverage side', () => {
@@ -47,6 +54,7 @@ describe('walked opposite-corner rectangle', () => {
     const a = captureCornerA({ x: 0, y: 0, heading: 0 }, true);
     const definition = defineWalkedRectangle(a, { x: 4, y: 10, heading: 0 }, 3, 5, true);
     expect(definition).toMatchObject({
+      originWorld: { x: 0, y: 0, heading: 0 },
       mAxisHeadingDeg: 0,
       mFt: 10,
       nFt: 4,
@@ -90,5 +98,15 @@ describe('walked opposite-corner rectangle', () => {
     expect(() => defineWalkedRectangle(a, { x: 4, y: -10, heading: 0 }, 0, 0, true)).toThrow(
       'ahead',
     );
+  });
+});
+
+describe('initial run-in readiness', () => {
+  it('accepts only a pose near the staging point and aligned along M', () => {
+    expect(isAtInitialStagingPose({ x: 0, y: -1, heading: 0 }, 0.75, 5)).toBe(true);
+    expect(isAtInitialStagingPose({ x: 0.3, y: -0.4, heading: 355 }, 0.75, 5)).toBe(true);
+    expect(isAtInitialStagingPose({ x: 0, y: 0, heading: 0 }, 0.75, 5)).toBe(false);
+    expect(isAtInitialStagingPose({ x: 0, y: -1, heading: 5.1 }, 0.75, 5)).toBe(false);
+    expect(isAtInitialStagingPose(null, 0.75, 5)).toBe(false);
   });
 });

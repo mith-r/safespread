@@ -24,8 +24,13 @@ reliability. Run the stages in order and stop at the first failed gate.
 
 ## Equipment and site
 
-- Rover with the current protocol-v2 firmware, charged drive battery, charged
-  control power, full actuator calibration, and spray valve proven to fail off.
+- Rover with the current hardened protocol-v2 firmware, charged drive battery,
+  charged control power, full actuator calibration, and spray valve proven to
+  fail off. The app must reject any firmware that does not advertise capability
+  `0x0202` during its safe connection probe.
+- PCA9685 `OE` held high by hardware during controller reset/power-up, then
+  enabled only after neutral ESC and steering pulses have been programmed.
+  Software cannot guarantee a neutral PCA9685 output before `setup()` executes.
 - iPhone with the current SafeSpreadVIO development build, enough free storage,
   Bluetooth enabled, and notifications/audio audible.
 - Completed repeatable quick-release mount. Fully seat and latch it before every
@@ -67,8 +72,14 @@ Confirm all of the following on the setup wizard:
   must be acknowledged without `F_HEADLAND`; the exported firmware log records
   the planned route style and its calculated clearance requirement.
 - The mount/steering/speed calibration identity is current for this hardware.
+- The saved operating load is the actual tank plus contents (or secured dry
+  ballast of equal mass). Changing that mass requires a new calibration ID and
+  another loaded steering/speed/reverse calibration.
 - Tracking is `normal`, the pose is stable for at least two seconds/30 samples,
   the newest pose is fresh, and the readiness checklist is fully green.
+- The rover is centered and aligned at the blue staging point 1.0 foot before
+  boundary A. Configure changes pose reporting into the rectangle frame; Arm is
+  allowed only after a fresh post-Configure pose reaches the firmware.
 - Pavement surface and dry/wet condition are correct. Wet remains locked out
   until Stages 1–8 have passed and their logs have been reviewed.
 - The mission log was created successfully. Wet Start is forbidden if the
@@ -132,13 +143,18 @@ Confirm all of the following on the setup wizard:
 ### 4. Loaded dry steering and speed calibration
 
 - Load the rover to intended operating mass on the actual dry pavement; spray
-  remains off. Cone the full calibration envelope.
+  remains off. Enter the actual tank-plus-contents weight in the app and cone
+  the full calibration envelope.
 - Run straight, left-curvature, right-curvature, forward-speed, reverse-speed,
   and direction-change calibration steps exactly as prompted. Repeat any sample
   rejected by the app; never reuse an old surface/load calibration silently.
 - Pass: calibration completes with a new current ID; the fitted steering map is
   monotonic with a measured zero-curvature point; all speed/direction checks
   finish without tracking, stall, wrong-direction, PWM, or I2C faults.
+- If the rover cannot move and bracket the 1.0 ft/s target before the firmware's
+  350-microsecond throttle-offset safety limit, stop. Check battery voltage,
+  ESC setup, gearing, drivetrain drag, traction, and load rather than raising
+  the software limit.
 - Export calibration logs before any autonomous pass.
 
 ### 5. Repeated one-pass dry runs in both directions
@@ -146,7 +162,9 @@ Confirm all of the following on the setup wizard:
 - Mark one straight M line at least 20 feet long, with the entered and coned clear
   pavement at each end. Enter N no wider than one spray pass. Keep spray off.
 - Run three passes in +M and three in -M at the lowest calibrated forward speed,
-  starting physically centered and aligned each time.
+  starting physically centered and aligned at the marked staging point 1.0 foot
+  before boundary A each time. The run-in remains dry until the calibrated
+  spray applicator crosses the field boundary.
 - Pass all six: p95 absolute cross-track <=1.275 inches, maximum <=2.55 inches,
   steering saturation <=10%, pose gap <=250 ms, no fault, and no unexplained
   rejected samples. Record measured endpoint and lateral errors.

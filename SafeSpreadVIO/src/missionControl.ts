@@ -25,6 +25,7 @@ export type MissionClientState = 'idle' | 'configured' | 'armed' | 'running' | '
 interface MissionControlOptions {
   timeoutMs?: number;
   retries?: number;
+  faultDumpTimeoutMs?: number;
   dryMode?: boolean;
   preferForwardOnly?: boolean;
 }
@@ -32,7 +33,7 @@ interface MissionControlOptions {
 interface PendingAck {
   commandId: number;
   received: AckV2 | null;
-  listeners: Set<(ack: AckV2) => void>;
+  listeners: Set<(ack: AckV2 | null) => void>;
 }
 
 class MissionOperationCancelled extends Error {
@@ -49,6 +50,7 @@ export class MissionControl {
   private readonly unsubscribe: () => void;
   private readonly timeoutMs: number;
   private readonly retries: number;
+  private readonly faultDumpTimeoutMs: number;
   private readonly dryMode: boolean;
   private readonly preferForwardOnly: boolean;
   private calibrationId = 0;
@@ -66,6 +68,10 @@ export class MissionControl {
     }
     this.timeoutMs = options.timeoutMs ?? 750;
     this.retries = options.retries ?? 2;
+    // The firmware intentionally sends the complete frozen fault buffer before
+    // its ACK. At the maximum sample count that takes substantially longer than
+    // an ordinary command acknowledgement.
+    this.faultDumpTimeoutMs = options.faultDumpTimeoutMs ?? Math.max(this.timeoutMs, 5000);
     this.dryMode = options.dryMode ?? true;
     this.preferForwardOnly = options.preferForwardOnly ?? true;
     this.unsubscribe = transport.subscribeAck((packet) => this.receiveAck(packet));
@@ -144,9 +150,11 @@ export class MissionControl {
   }
 
   async selfTest(): Promise<AckV2> {
+    if (!this.dryMode) throw new Error('self-test motion is dry-only');
     if (this.currentState !== 'idle' || !this.preparedCalibration) {
       throw new Error('calibration epoch must be prepared before self-test');
     }
+    if (!this.hasFreshPose()) throw new Error('a fresh valid pose is required for self-test');
     return this.command(4, [0], 'idle');
   }
 
@@ -154,7 +162,13 @@ export class MissionControl {
     if (this.currentState !== 'idle' && this.currentState !== 'fault') {
       throw new Error('Stop before requesting the fault dump');
     }
-    return this.command(8, [0, 5], this.currentState, false);
+    // Opcode 8 is not safe to retry while its response is in flight: current
+    // firmware replays every sample for a duplicate request. Wait once for the
+    // bounded dump instead of mixing duplicate samples in the app collector.
+    return this.command(8, [0, 5], this.currentState, false, {
+      timeoutMs: this.faultDumpTimeoutMs,
+      retries: 0,
+    });
   }
 
   async arm(): Promise<AckV2> {
@@ -165,6 +179,7 @@ export class MissionControl {
 
   async start(): Promise<AckV2> {
     if (this.currentState !== 'armed') throw new Error('mission must be armed before start');
+    if (!this.hasFreshPose()) throw new Error('a fresh valid pose is required before start');
     return this.command(2, [3], 'running');
   }
 
@@ -186,10 +201,20 @@ export class MissionControl {
   }
 
   notifyDisconnect(): void {
-    if (this.currentState !== 'idle') this.currentState = 'fault';
+    this.operationGeneration += 1;
+    if (['configured', 'armed', 'running'].includes(this.currentState)) {
+      this.currentState = 'fault';
+    }
+    this.cancelPendingAck();
+  }
+
+  notifyComplete(): void {
+    if (this.currentState === 'running') this.currentState = 'complete';
   }
 
   dispose(): void {
+    this.operationGeneration += 1;
+    this.cancelPendingAck();
     this.unsubscribe();
   }
 
@@ -198,6 +223,7 @@ export class MissionControl {
     expectedStates: number[],
     nextState: MissionClientState,
     validateCalibration = true,
+    waitOptions?: { timeoutMs: number; retries: number },
   ): Promise<AckV2> {
     return this.exclusive(async (generation) => {
       const commandId = this.takeCommandId();
@@ -205,6 +231,7 @@ export class MissionControl {
         buildCommandV2({ opcode, epoch: this.epoch, commandId }),
         commandId,
         generation,
+        waitOptions,
       );
       this.requireAck(ack, expectedStates, validateCalibration ? this.calibrationId : null);
       this.currentState = nextState;
@@ -230,6 +257,7 @@ export class MissionControl {
 
   private async priorityStop(): Promise<AckV2> {
     this.operationGeneration += 1;
+    this.cancelPendingAck();
     const commandId = this.takeCommandId();
     this.currentState = 'idle';
     this.preparedCalibration = null;
@@ -283,14 +311,17 @@ export class MissionControl {
     packet: Uint8Array,
     commandId: number,
     generation: number,
+    waitOptions?: { timeoutMs: number; retries: number },
   ): Promise<AckV2> {
     this.ensureCurrent(generation);
     this.pending = { commandId, received: null, listeners: new Set() };
+    const timeoutMs = waitOptions?.timeoutMs ?? this.timeoutMs;
+    const retries = waitOptions?.retries ?? this.retries;
     try {
-      for (let attempt = 0; attempt <= this.retries; attempt += 1) {
+      for (let attempt = 0; attempt <= retries; attempt += 1) {
         await this.transport.writeWithResponse(packet);
         this.ensureCurrent(generation);
-        const ack = await this.waitForAck();
+        const ack = await this.waitForAck(timeoutMs);
         this.ensureCurrent(generation);
         if (ack) return ack;
       }
@@ -300,20 +331,26 @@ export class MissionControl {
     }
   }
 
-  private waitForAck(): Promise<AckV2 | null> {
+  private waitForAck(timeoutMs: number): Promise<AckV2 | null> {
     if (!this.pending) return Promise.resolve(null);
     if (this.pending.received) return Promise.resolve(this.pending.received);
     return new Promise((resolve) => {
-      const listener = (ack: AckV2) => {
+      const listener = (ack: AckV2 | null) => {
         clearTimeout(timer);
         resolve(ack);
       };
       const timer = setTimeout(() => {
         this.pending?.listeners.delete(listener);
         resolve(null);
-      }, this.timeoutMs);
+      }, timeoutMs);
       this.pending!.listeners.add(listener);
     });
+  }
+
+  private cancelPendingAck(): void {
+    if (!this.pending) return;
+    for (const listener of this.pending.listeners) listener(null);
+    this.pending.listeners.clear();
   }
 
   private requireAck(ack: AckV2, states: number[], calibrationId: number | null): void {

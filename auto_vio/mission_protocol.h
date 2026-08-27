@@ -8,6 +8,15 @@
 
 class MissionProtocol {
  public:
+  // Keep the expected rectangle-frame staging pose centralized: route setup
+  // may move the run-in point without changing the safety checks themselves.
+  static constexpr float EXPECTED_START_X_FT = 0.0f;
+  static constexpr float EXPECTED_START_Y_FT = -1.0f;
+  static constexpr float EXPECTED_START_HEADING_DEG = 0.0f;
+  static constexpr float START_POSITION_TOLERANCE_FT = 0.75f;
+  static constexpr float START_HEADING_TOLERANCE_DEG = 5.0f;
+  static constexpr float START_MAX_SPEED_FPS = 0.10f;
+
   MissionState state() const { return state_; }
   FaultCode fault() const { return fault_; }
   uint16_t epoch() const { return epoch_; }
@@ -48,7 +57,11 @@ class MissionProtocol {
     hasRectangle_ = false;
     hasPose_ = false;
     posePending_ = false;
+    hasPoseSequence_ = false;
+    armedStartViolation_ = false;
+    latestPose_ = {};
     lastPoseSequence_ = 0;
+    poseReceivedAtMs_ = 0;
     droppedPoses_ = 0;
     fault_ = F_NONE;
     clearCommandCache();
@@ -73,6 +86,15 @@ class MissionProtocol {
     }
     rectangle_ = message;
     hasRectangle_ = true;
+    // Poses sent before this ACK are in the pre-rectangle coordinate frame.
+    // Do not let one satisfy ARM, reach control, or seed innovation checks in
+    // the rectangle frame. Retain the sequence watermark so a delayed replay
+    // of that old pose cannot become the required post-rectangle sample.
+    hasPose_ = false;
+    posePending_ = false;
+    armedStartViolation_ = false;
+    latestPose_ = {};
+    poseReceivedAtMs_ = 0;
     state_ = S_CONFIGURED;
     protocol_v2::AckV2 result = ack(message.epoch, message.commandId, F_NONE);
     cacheSetup(0x44, message.epoch, message.commandId, result);
@@ -101,16 +123,32 @@ class MissionProtocol {
     if ((message.flags & 0x01) == 0) return rejectPose(F_TRACKING_ERROR);
     if ((message.flags & 0x04) == 0) return rejectPose(F_CALIBRATION);
     if (message.ageMs > MAX_POSE_AGE_MS ||
-        (hasPose_ && message.sequence <= lastPoseSequence_)) {
+        (hasPoseSequence_ && message.sequence <= lastPoseSequence_)) {
       return rejectPose(F_POSE_INVALID);
     }
     if (std::fabs(message.speedFps) > MAX_SPEED_FPS ||
         std::fabs(message.yawRateDps) > MAX_YAW_RATE_DPS) {
       return rejectPose(F_POSE_INVALID);
     }
+    if (state_ == S_ARMED && !poseAtExpectedStart(message)) {
+      // The firmware caller turns any rejected ARMED pose into a latched
+      // hardware fault. Keep a local latch too, so START cannot proceed if a
+      // caller observes the rejection but has not yet performed that handoff.
+      armedStartViolation_ = true;
+      return rejectPose(F_TRACKING_ERROR);
+    }
     if (hasPose_) {
-      const float dt = (receivedAtMs - poseReceivedAtMs_) / 1000.0f;
-      if (dt <= 0.0f) return rejectPose(F_POSE_INVALID);
+      // BLE delivery jitter is not vehicle motion. Reconstruct the capture
+      // interval from each packet's age instead of differentiating solely by
+      // receive time. Unsigned receive subtraction intentionally handles the
+      // millis() wrap as long as consecutive poses are less than 2^31 ms apart.
+      const uint32_t receivedDeltaMs = receivedAtMs - poseReceivedAtMs_;
+      if (receivedDeltaMs > 0x7fffffffu) return rejectPose(F_POSE_INVALID);
+      const int64_t captureDeltaMs = static_cast<int64_t>(receivedDeltaMs) +
+          static_cast<int64_t>(latestPose_.ageMs) -
+          static_cast<int64_t>(message.ageMs);
+      if (captureDeltaMs <= 0) return rejectPose(F_POSE_INVALID);
+      const float dt = captureDeltaMs / 1000.0f;
       if (std::fabs(message.speedFps - latestPose_.speedFps) / dt > MAX_ACCEL_FPS2) {
         return rejectPose(F_POSE_JUMP);
       }
@@ -132,6 +170,7 @@ class MissionProtocol {
     if (posePending_) droppedPoses_++;
     latestPose_ = message;
     lastPoseSequence_ = message.sequence;
+    hasPoseSequence_ = true;
     poseReceivedAtMs_ = receivedAtMs;
     hasPose_ = true;
     posePending_ = true;
@@ -177,6 +216,11 @@ class MissionProtocol {
       fault_ = F_NONE;
       hasPose_ = false;
       posePending_ = false;
+      hasPoseSequence_ = false;
+      armedStartViolation_ = false;
+      latestPose_ = {};
+      lastPoseSequence_ = 0;
+      poseReceivedAtMs_ = 0;
       hasRectangle_ = false;
       hasCalibration_ = false;
       calibrationId_ = 0;
@@ -189,9 +233,12 @@ class MissionProtocol {
         result = ack(message.epoch, message.commandId, F_ROUTE);
       } else if (!poseFresh(nowMs)) {
         result = ack(message.epoch, message.commandId, F_POSE_TIMEOUT);
+      } else if (!poseAtExpectedStart(latestPose_)) {
+        result = ack(message.epoch, message.commandId, F_TRACKING_ERROR);
       } else if (!pwmReady_) {
         result = ack(message.epoch, message.commandId, F_PWM);
       } else {
+        armedStartViolation_ = false;
         state_ = S_ARMED;
         result = ack(message.epoch, message.commandId, F_NONE);
       }
@@ -200,6 +247,8 @@ class MissionProtocol {
         result = ack(message.epoch, message.commandId, F_ROUTE);
       } else if (!poseFresh(nowMs)) {
         result = ack(message.epoch, message.commandId, F_POSE_TIMEOUT);
+      } else if (armedStartViolation_ || !poseAtExpectedStart(latestPose_)) {
+        result = ack(message.epoch, message.commandId, F_TRACKING_ERROR);
       } else if (!pwmReady_) {
         result = ack(message.epoch, message.commandId, F_PWM);
       } else {
@@ -207,9 +256,18 @@ class MissionProtocol {
         result = ack(message.epoch, message.commandId, F_NONE);
       }
     } else if (message.opcode == 4) {
-      result = state_ == S_IDLE
-          ? ack(message.epoch, message.commandId, F_NONE)
-          : ack(message.epoch, message.commandId, F_ROUTE);
+      // The retained self-test drives both directions. Treat it as a dry
+      // calibration movement, not as an idle diagnostic that can bypass pose,
+      // calibration, or actuator readiness gates.
+      if (state_ != S_IDLE || !hasCalibration_ || !calibrationAllowed) {
+        result = ack(message.epoch, message.commandId, F_CALIBRATION);
+      } else if (!poseFresh(nowMs)) {
+        result = ack(message.epoch, message.commandId, F_POSE_TIMEOUT);
+      } else if (!pwmReady_) {
+        result = ack(message.epoch, message.commandId, F_PWM);
+      } else {
+        result = ack(message.epoch, message.commandId, F_NONE);
+      }
     } else if (message.opcode == 8) {
       result = state_ == S_IDLE || state_ == S_FAULT
           ? ack(message.epoch, message.commandId, F_NONE)
@@ -278,6 +336,8 @@ class MissionProtocol {
   protocol_v2::RectangleV2 rectangle_ = {};
   bool hasPose_ = false;
   bool posePending_ = false;
+  bool hasPoseSequence_ = false;
+  bool armedStartViolation_ = false;
   protocol_v2::PoseV2 latestPose_ = {};
   uint32_t lastPoseSequence_ = 0;
   uint32_t poseReceivedAtMs_ = 0;
@@ -313,6 +373,20 @@ class MissionProtocol {
 
   static float wrappedAngleDiff(float a, float b) {
     return std::fmod(a - b + 540.0f, 360.0f) - 180.0f;
+  }
+
+  static bool poseAtExpectedStart(const protocol_v2::PoseV2 &pose) {
+    if (!std::isfinite(pose.x) || !std::isfinite(pose.y) ||
+        !std::isfinite(pose.heading) || !std::isfinite(pose.speedFps)) {
+      return false;
+    }
+    const float dx = pose.x - EXPECTED_START_X_FT;
+    const float dy = pose.y - EXPECTED_START_Y_FT;
+    return std::sqrt(dx * dx + dy * dy) <= START_POSITION_TOLERANCE_FT &&
+           std::fabs(wrappedAngleDiff(
+               pose.heading, EXPECTED_START_HEADING_DEG)) <=
+               START_HEADING_TOLERANCE_DEG &&
+           std::fabs(pose.speedFps) <= START_MAX_SPEED_FPS;
   }
 
   static bool epochIsNewer(uint16_t candidate, uint16_t previous) {

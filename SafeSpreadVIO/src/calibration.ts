@@ -13,6 +13,7 @@ export interface CalibrationInput {
   cameraYawDeg: number;
   sprayForwardFt: number;
   sprayRightFt: number;
+  operatingLoadLb: number;
   surface: PavementSurface;
   condition: PavementCondition;
 }
@@ -23,7 +24,16 @@ export interface CalibrationRecord extends MountCalibration {
   createdAtIso: string;
   surface: PavementSurface;
   condition: PavementCondition;
+  operatingLoadLb: number;
+  /** App-observed proof that the firmware persisted the complete steering,
+   * speed, and reverse calibration for this exact ID. Older records omit it
+   * and remain safe for dry diagnostics only. */
+  motionCalibrationVerifiedAtIso?: string;
 }
+
+export type CalibrationDraft = Pick<CalibrationInput,
+  'cameraForwardFt' | 'cameraRightFt' | 'cameraYawDeg' |
+  'sprayForwardFt' | 'sprayRightFt' | 'operatingLoadLb' | 'surface'>;
 
 export interface MountYawFit {
   cameraYawDeg: number;
@@ -150,7 +160,8 @@ function requireInput(input: CalibrationInput): CalibrationInput {
     throw new Error('pavement condition is invalid');
   }
   [input.cameraForwardFt, input.cameraRightFt, input.cameraYawDeg,
-    input.sprayForwardFt, input.sprayRightFt].forEach(canonicalNumber);
+    input.sprayForwardFt, input.sprayRightFt, input.operatingLoadLb].forEach(canonicalNumber);
+  if (input.operatingLoadLb < 0) throw new Error('operating load must not be negative');
   return input;
 }
 
@@ -164,6 +175,7 @@ function canonicalFields(input: CalibrationInput): string {
     canonicalNumber(signedAngle(input.cameraYawDeg)),
     canonicalNumber(input.sprayForwardFt),
     canonicalNumber(input.sprayRightFt),
+    canonicalNumber(input.operatingLoadLb),
     input.surface,
     input.condition,
   ]);
@@ -200,9 +212,51 @@ export function createCalibration(input: CalibrationInput): CalibrationRecord {
     cameraYawDeg: canonicalNumber(signedAngle(input.cameraYawDeg)),
     sprayForwardFt: canonicalNumber(input.sprayForwardFt),
     sprayRightFt: canonicalNumber(input.sprayRightFt),
+    operatingLoadLb: canonicalNumber(input.operatingLoadLb),
     surface: input.surface,
     condition: input.condition,
   };
+}
+
+export function calibrationDraftMatches(
+  calibration: CalibrationRecord | null,
+  draft: CalibrationDraft,
+): boolean {
+  if (!calibration) return false;
+  try {
+    return canonicalNumber(draft.cameraForwardFt) === calibration.cameraForwardFt &&
+      canonicalNumber(draft.cameraRightFt) === calibration.cameraRightFt &&
+      canonicalNumber(signedAngle(draft.cameraYawDeg)) === calibration.cameraYawDeg &&
+      canonicalNumber(draft.sprayForwardFt) === calibration.sprayForwardFt &&
+      canonicalNumber(draft.sprayRightFt) === calibration.sprayRightFt &&
+      canonicalNumber(draft.operatingLoadLb) === calibration.operatingLoadLb &&
+      draft.surface === calibration.surface;
+  } catch {
+    return false;
+  }
+}
+
+export function hasMotionCalibrationProof(calibration: CalibrationRecord): boolean {
+  return typeof calibration.motionCalibrationVerifiedAtIso === 'string' &&
+    Number.isFinite(Date.parse(calibration.motionCalibrationVerifiedAtIso));
+}
+
+export function markMotionCalibrationVerified(
+  calibration: CalibrationRecord,
+  verifiedAtIso: string,
+): CalibrationRecord {
+  if (!isCalibrationRecord(calibration)) throw new Error('calibration record is invalid');
+  if (!Number.isFinite(Date.parse(verifiedAtIso))) {
+    throw new Error('motion calibration verification timestamp is invalid');
+  }
+  return { ...calibration, motionCalibrationVerifiedAtIso: verifiedAtIso };
+}
+
+export function motionCalibrationIdFromLog(line: string): number | null {
+  const match = /^\[CAL PASS\] Motion calibration saved for ID (\d+)\.$/.exec(line.trim());
+  if (!match) return null;
+  const id = Number(match[1]);
+  return Number.isInteger(id) && id >= 0 && id <= 0xffff ? id : null;
 }
 
 export function isCalibrationRecord(value: unknown): value is CalibrationRecord {
@@ -210,6 +264,9 @@ export function isCalibrationRecord(value: unknown): value is CalibrationRecord 
   const candidate = value as Partial<CalibrationRecord>;
   if (candidate.schemaVersion !== 1 || typeof candidate.hardwareTag !== 'string' ||
       typeof candidate.createdAtIso !== 'string' || typeof candidate.id !== 'number') return false;
+  if (candidate.motionCalibrationVerifiedAtIso !== undefined &&
+      (typeof candidate.motionCalibrationVerifiedAtIso !== 'string' ||
+       !Number.isFinite(Date.parse(candidate.motionCalibrationVerifiedAtIso)))) return false;
   try {
     const rebuilt = createCalibration({
       schemaVersion: 1,
@@ -220,6 +277,7 @@ export function isCalibrationRecord(value: unknown): value is CalibrationRecord 
       cameraYawDeg: candidate.cameraYawDeg as number,
       sprayForwardFt: candidate.sprayForwardFt as number,
       sprayRightFt: candidate.sprayRightFt as number,
+      operatingLoadLb: candidate.operatingLoadLb as number,
       surface: candidate.surface as PavementSurface,
       condition: candidate.condition as PavementCondition,
     });

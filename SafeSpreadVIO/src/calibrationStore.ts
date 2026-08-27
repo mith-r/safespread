@@ -1,12 +1,23 @@
 import { File, Paths } from 'expo-file-system';
-import { CalibrationRecord, isCalibrationRecord } from './calibration';
+import {
+  CalibrationRecord,
+  hasMotionCalibrationProof,
+  isCalibrationRecord,
+} from './calibration';
 
 export interface CalibrationStorageAdapter {
   read(): Promise<string | null>;
   write(value: string): Promise<void>;
 }
 
-export type CalibrationLoadReason = 'ready' | 'missing' | 'schema' | 'hardware' | 'corrupt';
+export type CalibrationLoadReason =
+  | 'ready'
+  | 'motion'
+  | 'load'
+  | 'missing'
+  | 'schema'
+  | 'hardware'
+  | 'corrupt';
 
 export interface CalibrationLoadResult {
   calibration: CalibrationRecord | null;
@@ -47,10 +58,21 @@ export async function loadCalibration(
     return dryOnly('corrupt');
   }
   if (typeof decoded !== 'object' || decoded === null) return dryOnly('corrupt');
-  const candidate = decoded as { schemaVersion?: unknown; hardwareTag?: unknown };
+  const candidate = decoded as {
+    schemaVersion?: unknown;
+    hardwareTag?: unknown;
+    operatingLoadLb?: unknown;
+  };
   if (candidate.schemaVersion !== 1) return dryOnly('schema');
   if (candidate.hardwareTag !== expectedHardwareTag) return dryOnly('hardware');
+  if (typeof candidate.operatingLoadLb !== 'number' ||
+      !Number.isFinite(candidate.operatingLoadLb) || candidate.operatingLoadLb < 0) {
+    return dryOnly('load');
+  }
   if (!isCalibrationRecord(decoded)) return dryOnly('corrupt');
+  if (!hasMotionCalibrationProof(decoded)) {
+    return { calibration: decoded, wetAllowed: false, reason: 'motion' };
+  }
   return { calibration: decoded, wetAllowed: true, reason: 'ready' };
 }
 

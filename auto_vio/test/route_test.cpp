@@ -29,6 +29,30 @@ static float appliedKappa(float commandUs) {
   return (commandUs / MAX_OFFSET) * kMax;
 }
 
+static int assertInitialRunIn(const RoutePoint *route, int count) {
+  assert(route != nullptr && count > 0);
+  assert(fabsf(route[0].x) < 0.001f);
+  assert(fabsf(route[0].y + INITIAL_RUN_IN_FT) < 0.001f);
+  assert(!route[0].spray && !route[0].reverse && !route[0].turning);
+
+  int firstSpray = -1;
+  for (int index = 0; index < count; ++index) {
+    if (route[index].y < -0.0001f) assert(!route[index].spray);
+    if (firstSpray < 0 && route[index].spray) firstSpray = index;
+  }
+  assert(firstSpray > 0);
+  for (int index = 0; index < firstSpray; ++index) {
+    assert(!route[index].spray);
+  }
+  assert(fabsf(route[firstSpray].x) < 0.001f);
+  assert(fabsf(route[firstSpray].y) < 0.001f);
+
+  const float dx = route[firstSpray].x - route[0].x;
+  const float dy = route[firstSpray].y - route[0].y;
+  assert(sqrtf(dx * dx + dy * dy) > 0.30f);
+  return firstSpray;
+}
+
 // Drive a simulated Ackermann rover, with the rover's real asymmetric radii,
 // along the whole plan -- reversing legs included. This is the part that used
 // to fail on grass with no way to see why.
@@ -44,8 +68,11 @@ static void simulatePrepared(float field, const char *label, int n) {
   int lanes = laneCount(field, BAR, OVERLAP);
   assert(n > 20);
 
-  int firstPassEnd = n;
-  for (int i = 0; i < n; i++) if (!sim[i].spray) { firstPassEnd = i; break; }
+  int firstPassStart = 0;
+  while (firstPassStart < n && !sim[firstPassStart].spray) firstPassStart++;
+  assert(firstPassStart < n);
+  int firstPassEnd = firstPassStart;
+  while (firstPassEnd < n && sim[firstPassEnd].spray) firstPassEnd++;
 
   float x = sim[0].x, y = sim[0].y, heading = 0.0f;
   int idx = 0, ticks = 0, stuck = 0;
@@ -101,12 +128,13 @@ static void simulatePrepared(float field, const char *label, int n) {
       worstStraightY = y;
     }
 
-    float limit = (idx < firstPassEnd) ? SPRAY_OFF_1ST : SPRAY_OFF;
+    const bool onFirstPass = idx >= firstPassStart && idx < firstPassEnd;
+    float limit = onFirstPass ? SPRAY_OFF_1ST : SPRAY_OFF;
     bool spraying = sim[idx].spray && off <= limit;
     if (spraying) sprayedFt += STEP;
 
     // The first pass must spray without interruption along its length.
-    if (idx < firstPassEnd && !spraying && y > 0.5f && y < field - 0.5f) {
+    if (onFirstPass && !spraying && y > 0.5f && y < field - 0.5f) {
       firstPassGap = true;
     }
     ticks++;
@@ -164,12 +192,14 @@ int main() {
   }
 
   // --- the real field -----------------------------------------------------
-  int n = 0, lanes = 0;
+  int n = 0, lanes = 0, firstPassStart = 0;
   const float FIELD = 21.91f;
   {
     n = buildRoute(FIELD, FIELD, BAR, OVERLAP, RL, RR, pts, 6000);
     lanes = laneCount(FIELD, BAR, OVERLAP);
     assert(n > 100 && n < 6000);
+    assert(pts[n - 1].terminal);
+    firstPassStart = assertInitialRunIn(pts, n);
 
     // Every lane must actually get sprayed somewhere along its length.
     for (int lane = 0; lane < lanes; lane++) {
@@ -185,7 +215,7 @@ int main() {
     // backing up.
     for (int i = 0; i < n; i++) {
       if (!pts[i].spray) continue;
-      assert(pts[i].y >= -0.01f && pts[i].y <= FIELD + 0.01f);
+      assert(pts[i].y >= -0.0001f && pts[i].y <= FIELD + 0.01f);
       assert(pts[i].x >= -0.01f && pts[i].x <= FIELD + 0.01f);
       assert(!pts[i].reverse);
     }
@@ -195,10 +225,6 @@ int main() {
       float dx = pts[i].x - pts[i - 1].x, dy = pts[i].y - pts[i - 1].y;
       assert(sqrtf(dx * dx + dy * dy) <= ROUTE_STEP_FT * 2.5f);
     }
-
-    // The route begins under the rover, already spraying.
-    assert(fabsf(pts[0].x) < 0.01f && fabsf(pts[0].y) < 0.01f);
-    assert(pts[0].spray && !pts[0].reverse);
 
     int reversals = 0;
     for (int i = 1; i < n; i++) if (pts[i].reverse != pts[i - 1].reverse) reversals++;
@@ -212,18 +238,23 @@ int main() {
   // it sits on x=0, so any test based on being inside the rectangle clips it.
   {
     int firstPassEnd = n;
-    for (int i = 0; i < n; i++) if (!pts[i].spray) { firstPassEnd = i; break; }
+    for (int i = firstPassStart; i < n; i++) {
+      if (!pts[i].spray) {
+        firstPassEnd = i;
+        break;
+      }
+    }
 
-    assert(firstPassEnd > 2);
-    for (int i = 0; i < firstPassEnd; i++) {
+    assert(firstPassEnd > firstPassStart + 2);
+    for (int i = firstPassStart; i < firstPassEnd; i++) {
       assert(pts[i].spray);
       assert(fabsf(pts[i].x) < 0.01f);          // dead straight
     }
     // and it runs the full length of the field
-    assert(fabsf(pts[0].y) < 0.01f);
+    assert(fabsf(pts[firstPassStart].y) < 0.01f);
     assert(fabsf(pts[firstPassEnd - 1].y - FIELD) < 0.01f);
     printf("route_test: first pass sprays %d points, 0.0 -> %.2f ft, unbroken\n",
-           firstPassEnd, pts[firstPassEnd - 1].y);
+           firstPassEnd - firstPassStart, pts[firstPassEnd - 1].y);
   }
 
   // --- how far outside the rectangle the route reaches --------------------
@@ -249,6 +280,8 @@ int main() {
     static RoutePoint small[6000];
     int sn = buildRoute(10.0f, 10.0f, BAR, OVERLAP, RL, RR, small, 6000);
     assert(sn > 50);
+    assert(small[sn - 1].terminal);
+    assertInitialRunIn(small, sn);
     int sl = laneCount(10.0f, BAR, OVERLAP);
     for (int lane = 0; lane < sl; lane++) {
       float laneX = laneCenterX(lane, BAR, OVERLAP);
@@ -271,15 +304,19 @@ int main() {
     int ln = buildRoute(20.0f, 1.0f, BAR, OVERLAP, RL, RR, line, 6000);
     assert(laneCount(1.0f, BAR, OVERLAP) == 1);
     assert(ln > 10);
+    const int lineFirstSpray = assertInitialRunIn(line, ln);
     for (int i = 0; i < ln; i++) {
-      assert(line[i].spray);            // sprays the whole way
+      assert(line[i].spray == (i >= lineFirstSpray));
       assert(!line[i].reverse);         // never backs up
       assert(!line[i].turning);         // and never turns
       assert(fabsf(line[i].x) < 0.01f); // dead straight along x=0
     }
-    assert(fabsf(line[0].y) < 0.01f);
+    assert(line[ln - 1].terminal);
+    assert(fabsf(line[0].y + INITIAL_RUN_IN_FT) < 0.01f);
+    assert(fabsf(line[lineFirstSpray].y) < 0.01f);
     assert(fabsf(line[ln - 1].y - 20.0f) < 0.01f);
-    printf("route_test: 20x1 -> %d points, one straight sprayed pass\n", ln);
+    printf("route_test: 20x1 -> %d points, dry %.1f-ft run-in then one sprayed pass\n",
+           ln, INITIAL_RUN_IN_FT);
   }
 
   // --- following the route, reversing included ----------------------------
@@ -296,6 +333,8 @@ int main() {
     assert(forward.style == ROUTE_FORWARD_ONLY);
     assert(forward.count > 0 && !forward.requirements.truncated);
     assert(forward.requirements.reversals == 0);
+    assert(selected[forward.count - 1].terminal);
+    assertInitialRunIn(selected, forward.count);
     float forwardMinX = selected[0].x, forwardMaxX = selected[0].x;
     for (int i = 1; i < forward.count; ++i) {
       if (selected[i].x < forwardMinX) forwardMinX = selected[i].x;
