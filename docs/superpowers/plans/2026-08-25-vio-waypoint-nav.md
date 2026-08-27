@@ -18,7 +18,7 @@
 - BLE device name `SafeSpread`; Nordic UART service `6E400001-B5A3-F393-E0A9-E50E24DCCA9E`, RX char `6E400002-...`, TX char `6E400003-...`.
 - No new rover hardware beyond the phone. iOS-only — no Android code paths.
 - Firmware VIO-timeout safety stop: no valid `!P` packet for >1000ms → hard stop, mission resets to idle.
-- The phone is the *sole* pose source for this sketch. `auto/auto.ino` (Bluefruit-heading + internal dead reckoning) is left untouched as a reference/fallback, not modified.
+- The phone is the *sole* pose source for this sketch. `OLD/auto/auto.ino` (Bluefruit-heading + internal dead reckoning) is left untouched as a reference/fallback, not modified.
 
 ---
 

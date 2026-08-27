@@ -4,7 +4,7 @@ Date: 2026-08-25
 
 ## Problem
 
-`auto/auto.ino` drives an 8-pass "grid" over a 480 sqft (21.91 ft x 21.91 ft)
+`OLD/auto/auto.ino` drives an 8-pass "grid" over a 480 sqft (21.91 ft x 21.91 ft)
 square but does not reliably cover it. Two independent root causes:
 
 1. **Lane spacing doesn't match the spray bar.** Passes are spaced 3.13 ft
@@ -118,7 +118,7 @@ correct):**
 | 10-13 | heading, degrees (0-360) | float32 LE |
 | 14 | CRC = `~(sum of bytes 0-13) & 0xFF` | uint8 |
 
-### 2. Firmware (`auto_vio/auto_vio.ino`, new sketch — `auto/auto.ino` kept as-is for reference)
+### 2. Firmware (`auto_vio/auto_vio.ino`, new sketch — `OLD/auto/auto.ino` kept as-is for reference)
 
 - Drops all internal dead-reckoning. `robotX_ft/robotY_ft/robotHeading` are
   set directly from parsed `!P` packets — no `posX/posY` integration, no
