@@ -147,9 +147,11 @@ inline float turnForwardExtent(const TurnPlan &p) {
 }
 
 /** Best maneuver for the required sideways shift. A shift big enough to drive
- *  forward round is driven forward round. For an adjacent-lane shift choose
- *  the three-point turn with the smallest forward/headland extent; path length
- *  only breaks a tie. */
+ *  forward round is driven forward round. When both adjacent-lane K-turns are
+ *  geometrically possible, lead on right lock. Wet-run telemetry shows this
+ *  rover's forward-right arc follows its model while forward-left runs much
+ *  wider; the tiny theoretical extent advantage of the left-led plan cost
+ *  most of the next sprayed pass while it recovered. */
 inline bool planHeadlandTurn(float shiftFt, float rLeft, float rRight,
                              TurnPlan &p) {
   if (solveForwardUTurn(shiftFt, rLeft, rRight, p)) return true;
@@ -159,11 +161,7 @@ inline bool planHeadlandTurn(float shiftFt, float rLeft, float rRight,
   bool okCw  = solveKTurn(shiftFt, rLeft, rRight, false, cw);
 
   if (okCcw && okCw) {
-    const float ccwExtent = turnForwardExtent(ccw);
-    const float cwExtent = turnForwardExtent(cw);
-    p = (ccwExtent < cwExtent ||
-         (fabsf(ccwExtent - cwExtent) < 0.01f && ccw.lengthFt <= cw.lengthFt))
-        ? ccw : cw;
+    p = cw;
     return true;
   }
   if (okCcw) { p = ccw; return true; }

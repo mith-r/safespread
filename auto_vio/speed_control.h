@@ -37,7 +37,13 @@ struct SpeedPI {
   static constexpr float BREAKAWAY_RATE_US_PER_SECOND = 100.0f;
   static constexpr float MAX_BREAKAWAY_US = 100.0f;
   static constexpr float MOTION_THRESHOLD_FPS = 0.05f;
-  static constexpr float NO_MOTION_TIMEOUT_SECONDS = 1.0f;
+  // The breakaway ramp itself takes one second to reach full strength. The
+  // old one-second timeout therefore faulted at the exact instant the rover
+  // finally received its full starting push, without giving that push time
+  // to overcome wet-ground or drivetrain stiction. Allow two seconds at full
+  // breakaway; the independent four-second route-progress watchdog still
+  // stops a rover that is genuinely jammed.
+  static constexpr float NO_MOTION_TIMEOUT_SECONDS = 3.0f;
   static constexpr float MAX_DT_SECONDS = 0.5f;
   static constexpr float MAX_TARGET_SLEW_FPS2 = 1.0f;
 

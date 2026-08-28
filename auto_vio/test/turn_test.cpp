@@ -51,9 +51,11 @@ static void checkTurn(float shift, float rLeft, float rRight) {
     float turned = fabsf(ch - ph) * TURN_PI / 180.0f;
     // A three-point turn has genuine cusps: at the moment it changes from
     // forward to reverse the rover doubles back, so a step straddling one
-    // covers almost no ground while still rotating. That is the maneuver
-    // working, not a curvature violation, so measure only within a leg.
-    if (cr == pr && moved > 1e-4f) {
+    // covers almost no ground while still rotating. Near the family boundary
+    // an entire reverse leg can be shorter than one sample, leaving both ends
+    // marked forward, so also require meaningful displacement before treating
+    // the sample as a single arc.
+    if (cr == pr && moved > step * 0.5f) {
       assert(turned / moved <= (1.0f / tightest) + 0.05f);
     }
     walked += moved;
@@ -116,9 +118,11 @@ int main() {
     printf("turn_test: reversing in place costs %.1f ft of travel\n", p.lengthFt);
   }
 
-  // --- asymmetry is actually used ----------------------------------------
-  // With unequal radii, choose the maneuver that consumes less headland even
-  // when it is not the shortest driving path.
+  // --- measured wet-ground asymmetry is actually used --------------------
+  // Both solutions are exact on paper, but the latest wet run showed the
+  // forward-left entry running far wider than its model while forward-right
+  // tracked tightly. Prefer the right-led plan even when its modeled extent
+  // is a little larger.
   {
     TurnPlan ccw, cw;
     solveKTurn(1.204f, RL, RR, true, ccw);
@@ -128,10 +132,12 @@ int main() {
 
     TurnPlan chosen;
     planHeadlandTurn(1.204f, RL, RR, chosen);
-    float bestExtent = fminf(turnForwardExtent(ccw), turnForwardExtent(cw));
-    assert(fabsf(turnForwardExtent(chosen) - bestExtent) < 0.01f);
-    printf("turn_test: same shift reaches %.1f/%.1f ft out; compact choice %.1f ft\n",
-           turnForwardExtent(ccw), turnForwardExtent(cw), bestExtent);
+    assert(!chosen.leg[0].steerLeft);
+    assert(fabsf(chosen.lengthFt - cw.lengthFt) < 0.01f);
+    printf("turn_test: same shift reaches %.1f/%.1f ft out; wet-proven "
+           "right-led choice %.1f ft\n",
+           turnForwardExtent(ccw), turnForwardExtent(cw),
+           turnForwardExtent(chosen));
   }
 
   // --- a symmetric rover still works -------------------------------------

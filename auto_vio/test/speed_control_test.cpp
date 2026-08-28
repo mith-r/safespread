@@ -46,11 +46,16 @@ int main() {
   assert(first > 120 && second > first);
   assert(std::fabs(breakaway.integralUs) < 0.001f);
 
-  // One second without motion faults and returns neutral offset. Further
-  // calls cannot wind throttle until an explicit reset.
+  // Full breakaway is reached after one second, then gets two seconds to work.
+  // This prevents the controller from faulting at the exact instant it first
+  // supplies maximum starting power on wet ground.
   SpeedPI noMotion;
   noMotion.feedForwardUs = 120.0f;
-  for (int index = 0; index < 5; ++index) noMotion.update(1.0f, 0.0f, 0.2f);
+  for (int index = 0; index < 14; ++index) noMotion.update(1.0f, 0.0f, 0.2f);
+  assert(!noMotion.stalled);
+  assert(std::fabs(noMotion.breakawayUs - SpeedPI::MAX_BREAKAWAY_US) < 0.001f);
+  assert(noMotion.lastOffsetUs > 0);
+  noMotion.update(1.0f, 0.0f, 0.2f);
   assert(noMotion.stalled);
   assert(noMotion.lastOffsetUs == 0);
   const float frozenIntegral = noMotion.integralUs;
