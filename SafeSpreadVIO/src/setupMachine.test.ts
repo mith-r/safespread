@@ -39,7 +39,6 @@ function enteredReadyState(options: { wet?: boolean; loggingReady?: boolean } = 
     { type: 'SET_CALIBRATION_STATUS', status: 'ready' },
     { type: 'SET_WET_MODE', wet: options.wet ?? false },
     { type: 'SET_LOGGING_READY', ready: options.loggingReady ?? true },
-    { type: 'CONTINUE' },
     {
       type: 'SET_READINESS',
       trackingNormal: true,
@@ -83,7 +82,7 @@ describe('setupReducer', () => {
     expect(state.phase).toBe('rectangle');
     expect(state.validationError).toMatch(/left.*confirm/i);
     state = reduce(state, { type: 'CONFIRM_COVERAGE_SIDE' }, { type: 'CONTINUE' });
-    expect(state.phase).toBe('calibration');
+    expect(state.phase).toBe('readiness');
   });
 
   it('rejects unstable corner captures and requires return to A before walked arming', () => {
@@ -121,7 +120,6 @@ describe('setupReducer', () => {
       { type: 'CONTINUE' },
       { type: 'SET_CALIBRATION_STATUS', status: 'ready' },
       { type: 'SET_LOGGING_READY', ready: true },
-      { type: 'CONTINUE' },
       {
         type: 'SET_READINESS',
         trackingNormal: true,
@@ -172,7 +170,7 @@ describe('setupReducer', () => {
     expect(state.phase).toBe('rectangle');
     expect(state.validationError).toMatch(/left.*confirm/i);
     state = reduce(state, { type: 'CONFIRM_COVERAGE_SIDE' }, { type: 'CONTINUE' });
-    expect(state.phase).toBe('calibration');
+    expect(state.phase).toBe('readiness');
   });
 
   it('does not advance for incompatible firmware', () => {

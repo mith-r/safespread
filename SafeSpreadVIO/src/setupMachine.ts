@@ -296,7 +296,10 @@ export function setupReducer(state: SetupState, action: SetupAction): SetupState
         if (state.rectangle.side === 'left' && !state.coverageSideConfirmed) {
           return fail(state, 'Left coverage side must be explicitly confirmed.');
         }
-        return { ...state, phase: 'calibration', validationError: null };
+        // Stored calibration carries between runs. Calibration and diagnostics
+        // remain available from the fixed header instead of blocking every
+        // mission as a required wizard step.
+        return { ...state, phase: 'readiness', validationError: null };
       }
       if (state.phase === 'calibration') {
         if (state.wet && state.calibrationStatus !== 'ready') {
