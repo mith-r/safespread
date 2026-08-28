@@ -19,7 +19,10 @@ export interface MissionMetadata {
     surface: 'asphalt' | 'concrete' | 'pavers' | 'other';
     condition: 'dry' | 'wet';
   };
-  rectangle: {
+  // Absent for a diagnostic session. The self-test needs a connection and an
+  // epoch but no rectangle, and requiring one here is what kept it from running
+  // on a rover that could not be set up in the first place.
+  rectangle?: {
     source: 'entered' | 'walked';
     mFt: number;
     nFt: number;

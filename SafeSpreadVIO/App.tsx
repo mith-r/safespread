@@ -90,6 +90,7 @@ export default function App() {
   const rectangleConfiguredRef = useRef(false);
   const calibrationPreparedRef = useRef(false);
   const resourceWetRef = useRef<boolean | null>(null);
+  const resourceHasRectangleRef = useRef(false);
   const lastPoseOfferedSequenceRef = useRef(0);
   const poseBySequenceRef = useRef(new Map<number, MissionRecord>());
   const faultPacketsRef = useRef<Uint8Array[]>([]);
@@ -183,16 +184,26 @@ export default function App() {
     rectangleConfiguredRef.current = false;
     calibrationPreparedRef.current = false;
     resourceWetRef.current = null;
+    resourceHasRectangleRef.current = false;
     poseBySequenceRef.current.clear();
     if (closeLog) await closeLogger().catch((error) => {
       setOperationError(error instanceof Error ? error.message : String(error));
     });
   }
 
-  async function ensureMissionResources() {
-    if (!setup.rectangle) throw new Error('Define the rectangle before starting a mission.');
+  // `requireRectangle` is false for diagnostics. A self-test needs a connection
+  // and an epoch, nothing more -- the rectangle only ever fed the mission log
+  // header. Gating it behind setup made the one command that reports why the
+  // rover will not move unreachable on a rover that will not move.
+  async function ensureMissionResources({ requireRectangle = true } = {}) {
+    if (requireRectangle && !setup.rectangle) {
+      throw new Error('Define the rectangle before starting a mission.');
+    }
+    // Resources built for a diagnostic have no rectangle in their log header,
+    // so a real mission must rebuild rather than inherit a headerless log.
     if (controlRef.current && senderRef.current && epochRef.current !== null &&
         resourceWetRef.current === setup.wet &&
+        (!requireRectangle || resourceHasRectangleRef.current) &&
         (!setup.wet || isAuthoritativeLogReady(loggerRef.current))) {
       return { control: controlRef.current, epoch: epochRef.current };
     }
@@ -219,12 +230,12 @@ export default function App() {
           surface: calibration?.surface ?? 'other',
           condition: setup.wet ? 'wet' : 'dry',
         },
-        rectangle: {
+        rectangle: setup.rectangle ? {
           source: setup.rectangle.source,
           mFt: setup.rectangle.mFt,
           nFt: setup.rectangle.nFt,
           side: setup.rectangle.side,
-        },
+        } : undefined,
       }, fileLog.sink);
       loggerRef.current = logger;
       setLogName(fileLog.uri.split('/').pop() ?? missionId);
@@ -249,6 +260,7 @@ export default function App() {
     rectangleConfiguredRef.current = false;
     calibrationPreparedRef.current = false;
     resourceWetRef.current = setup.wet;
+    resourceHasRectangleRef.current = !!setup.rectangle;
     faultHandledRef.current = false;
     faultPacketsRef.current = [];
     setFaultDumpUri(null);
@@ -614,7 +626,7 @@ export default function App() {
     try {
       if (setup.wet) throw new Error('Select Dry diagnostic before the self-test.');
       if (!calibration) throw new Error('Save mount and pavement calibration before the self-test.');
-      const { control } = await ensureMissionResources();
+      const { control } = await ensureMissionResources({ requireRectangle: false });
       operationGateRef.current.assertCurrent(operation.generation);
       if (!calibrationPreparedRef.current) {
         await control.prepareCalibration(calibration);

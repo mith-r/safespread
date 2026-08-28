@@ -11,6 +11,14 @@ reliability. Run the stages in order and stop at the first failed gate.
 - For an individual straight pass, require absolute cross-track p95 no greater
   than 1.275 inches (0.106 ft), no accepted sample above 2.55 inches (0.2125
   ft), and steering saturation no greater than 10%.
+- Speed is servoed, not preset. Forward straights hold 1.5 ft/s and turns and
+  reverse hold 0.7 ft/s; the loop is expected to move `throttle_us` around to
+  keep them. Once a pass is under way, require measured `speed_fps` within
+  0.15 ft/s of its target, and treat `throttle_us` sitting at the 1900 us
+  ceiling as a failed pass -- the rover has run out of throttle and is holding
+  less than the speed it was told to. A full tank needs about five seconds to
+  reach cruise from a standing start; measure the band after that, not through
+  it.
 - The replay summary must say `acceptance=accepted`, `fault=0`, and end at the
   expected route index. Investigate every rejected sample; an isolated stale
   test frame is allowed only in the supplied software fixture, not ignored in
@@ -139,14 +147,18 @@ Confirm all of the following on the setup wizard:
 - Pass: calibration completes with a new current ID; the fitted steering map is
   monotonic with a measured zero-curvature point; all speed/direction checks
   finish without tracking, stall, wrong-direction, PWM, or I2C faults.
+- The speed step only fits the feed-forward the loop starts from; it does not
+  set the speed the rover holds. Changing the straight or turn target does not
+  invalidate a stored calibration and does not require repeating this stage.
 - Export calibration logs before any autonomous pass.
 
 ### 5. Repeated one-pass dry runs in both directions
 
 - Mark one straight M line at least 20 feet long, with the entered and coned clear
   pavement at each end. Enter N no wider than one spray pass. Keep spray off.
-- Run three passes in +M and three in -M at the lowest calibrated forward speed,
-  starting physically centered and aligned each time.
+- Run three passes in +M and three in -M, starting physically centered and
+  aligned each time. Speed is not selectable: the loop holds the 1.5 ft/s
+  straight target.
 - Pass all six: p95 absolute cross-track <=1.275 inches, maximum <=2.55 inches,
   steering saturation <=10%, pose gap <=250 ms, no fault, and no unexplained
   rejected samples. Record measured endpoint and lateral errors.
@@ -200,8 +212,10 @@ Confirm all of the following on the setup wizard:
 - This stage is **not approved by automated tests**. It may begin only after a
   human review confirms every dry gate above and no unexplained rejection,
   saturation, pose-gap, or fault pattern remains.
-- Use the smallest practical rectangle, the lowest calibrated speed, generous
-  coned headlands, and the intended wet load. First validate with water when
+- Use the smallest practical rectangle, generous coned headlands, and the
+  intended wet load. Speed is the same servoed 1.5 ft/s as every dry stage, so
+  there is no slower setting to fall back on -- if wet traction will not hold
+  that speed, stop rather than looking for one. First validate with water when
   conditions permit; then use brine. Keep the operator ready on Stop throughout.
 - Run one entered and one walked-corner rectangle. Inspect traction, stopping
   distance, line error, overlap, application consistency, and all exported logs

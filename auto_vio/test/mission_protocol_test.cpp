@@ -142,6 +142,34 @@ int main() {
   assert(ack.state == S_IDLE);
   assert(protocol.acceptCalibration(calibration(7, 5, 14), 2050).faultCode == F_ROUTE);
 
+  // The self test is the only command that reports which I2C failure is
+  // actually happening, so nothing about a mission may be required to run it.
+  // A rover whose PWM chip is not answering cannot produce a mission epoch in
+  // the first place, which is what used to make this unreachable.
+  MissionProtocol diagnostics;
+  assert(diagnostics.state() == S_IDLE);
+  diagnostics.setPwmReady(false);            // the condition being diagnosed
+  AckV2 unconfigured = diagnostics.acceptCommand({4, 4242, 9}, 3000);
+  assert(unconfigured.faultCode == F_NONE);  // never configured, epoch unknown
+
+  // Available from S_FAULT too, like the fault dump it accompanies -- that is
+  // the state an operator is in when they need it.
+  diagnostics.setFault(F_PWM);
+  assert(diagnostics.state() == S_FAULT);
+  assert(diagnostics.acceptCommand({4, 4242, 10}, 3010).faultCode == F_NONE);
+
+  // A rewound command id must not lock diagnostics out; the app restarting is
+  // not a reason to refuse the servo test.
+  assert(diagnostics.acceptCommand({4, 4242, 1}, 3020).faultCode == F_NONE);
+
+  // It stays refused once the rover is under mission control, where motion is
+  // the route's to command.
+  MissionProtocol armedGate;
+  configure(armedGate);
+  assert(armedGate.acceptPose(pose(1), 1000));
+  assert(armedGate.acceptCommand({1, 7, 3}, 1000).state == S_ARMED);
+  assert(armedGate.acceptCommand({4, 7, 4}, 1000).faultCode == F_ROUTE);
+
   std::printf("mission_protocol_test: all assertions passed\n");
   return 0;
 }

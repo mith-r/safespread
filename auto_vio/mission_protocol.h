@@ -164,8 +164,8 @@ class MissionProtocol {
         return entry.response;
       }
     }
-    if (message.opcode != 3 && message.epoch == epoch_ && hasCommandWatermark_ &&
-        message.commandId <= commandWatermark_) {
+    if (message.opcode != 3 && message.opcode != 4 && message.epoch == epoch_ &&
+        hasCommandWatermark_ && message.commandId <= commandWatermark_) {
       protocol_v2::AckV2 rejected = ack(message.epoch, message.commandId, F_ROUTE);
       cacheCommand(message, rejected);
       return rejected;
@@ -182,6 +182,17 @@ class MissionProtocol {
       calibrationId_ = 0;
       clearSetupCache();
       result = ack(message.epoch, message.commandId, F_NONE);
+    } else if (message.opcode == 4) {
+      // The self test answers "why will nothing move", so it cannot require a
+      // configured mission: an operator whose PWM chip is not answering has no
+      // way to produce one, and the I2C probe is the only thing that names the
+      // actual fault. Handled ahead of the epoch check for the same reason Stop
+      // is, and accepted from S_FAULT for the same reason the fault dump is --
+      // those are precisely the states it is needed in. Still refused while
+      // armed or running, where the rover is under mission control.
+      result = state_ == S_IDLE || state_ == S_FAULT
+          ? ack(message.epoch, message.commandId, F_NONE)
+          : ack(message.epoch, message.commandId, F_ROUTE);
     } else if (message.epoch != epoch_) {
       result = ack(message.epoch, message.commandId, F_ROUTE);
     } else if (message.opcode == 1) {
@@ -206,10 +217,6 @@ class MissionProtocol {
         state_ = S_RUNNING;
         result = ack(message.epoch, message.commandId, F_NONE);
       }
-    } else if (message.opcode == 4) {
-      result = state_ == S_IDLE
-          ? ack(message.epoch, message.commandId, F_NONE)
-          : ack(message.epoch, message.commandId, F_ROUTE);
     } else if (message.opcode == 8) {
       result = state_ == S_IDLE || state_ == S_FAULT
           ? ack(message.epoch, message.commandId, F_NONE)
