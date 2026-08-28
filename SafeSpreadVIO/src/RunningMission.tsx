@@ -1,11 +1,11 @@
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
 import PathMap from './PathMap';
 import { PathPoint } from './pathMath';
 import { Pose } from './poseMath';
 import { RectangleDefinition } from './rectangle';
 import { SetupPhase } from './setupMachine';
-import { TelemetryV2 } from './protocolV2';
+import { RoutePlanV2, TelemetryV2 } from './protocolV2';
 
 interface RunningMissionProps {
   phase: SetupPhase;
@@ -14,9 +14,13 @@ interface RunningMissionProps {
   telemetry: TelemetryV2 | null;
   rectangle: RectangleDefinition;
   path: PathPoint[];
+  routePlan: RoutePlanV2 | null;
   fault: string | null;
   logName: string | null;
   faultDumpReady: boolean;
+  /** Total distance ARKit has moved the world under the rover this mission.
+   *  Coverage laid down after a shift is not where the map says it is. */
+  relocalizationShiftFt: number;
   busy: boolean;
   /** Sprayed pass the rover was driving, counted in route order from zero. */
   currentPassIndex: number;
@@ -33,7 +37,17 @@ function stateLabel(phase: SetupPhase): string {
 }
 
 export default function RunningMission(props: RunningMissionProps) {
-  const [mapOpen, setMapOpen] = useState(false);
+  // The map is the only view that shows where the rover has actually been, so
+  // it opens with the run rather than waiting to be asked for. It stays a modal
+  // the operator can dismiss; closing it during a run is not overridden.
+  const [mapOpen, setMapOpen] = useState(props.phase === 'running');
+  const wasRunningRef = useRef(props.phase === 'running');
+  useEffect(() => {
+    const running = props.phase === 'running';
+    if (running && !wasRunningRef.current) setMapOpen(true);
+    wasRunningRef.current = running;
+  }, [props.phase]);
+
   const [resumePass, setResumePass] = useState<number | null>(null);
   const telemetry = props.telemetry;
   // Default to the pass that was interrupted: it was cut short, so it is the
@@ -73,6 +87,17 @@ export default function RunningMission(props: RunningMissionProps) {
         <Text style={styles.metric}>Steering / throttle {telemetry ? `${telemetry.steeringUs} / ${telemetry.throttleUs} µs` : '—'}</Text>
         <Text style={styles.metric}>Pose age {telemetry?.poseAgeMs ?? '—'} ms · dropped {telemetry?.droppedPackets ?? '—'}</Text>
       </View>
+
+      {props.relocalizationShiftFt > 0 ? (
+        <View style={styles.warnCard}>
+          <Text style={styles.warnTitle}>Tracking frame moved</Text>
+          <Text style={styles.warnText}>
+            ARKit has shifted the world {props.relocalizationShiftFt.toFixed(2)} ft this
+            mission. Coverage laid down after the shift is that far from where the map
+            shows it, even though cross-track error still reads clean.
+          </Text>
+        </View>
+      ) : null}
 
       {props.fault ? (
         <View style={styles.faultCard}>
@@ -142,6 +167,10 @@ export default function RunningMission(props: RunningMissionProps) {
         onClose={() => setMapOpen(false)}
         definition={props.rectangle}
         points={props.path}
+        routePlan={props.routePlan}
+        status={`${stateLabel(props.phase)} · ${props.trackingDetail}`}
+        spraying={spraying}
+        onStop={stopped ? undefined : () => void props.onStop()}
       />
     </View>
   );
@@ -158,6 +187,9 @@ const styles = StyleSheet.create({
   card: { backgroundColor: 'rgba(25,25,25,0.94)', borderRadius: 10, padding: 14, gap: 5 },
   cardTitle: { color: '#9ecbff', fontWeight: '800', fontSize: 17, marginBottom: 3 },
   metric: { color: 'white', fontFamily: 'Menlo', fontSize: 14 },
+  warnCard: { backgroundColor: '#3d3210', borderColor: '#ffb300', borderWidth: 1, borderRadius: 10, padding: 14, gap: 6 },
+  warnTitle: { color: '#ffd54f', fontSize: 17, fontWeight: '900' },
+  warnText: { color: 'white', fontSize: 14, lineHeight: 20 },
   faultCard: { backgroundColor: '#3d1010', borderColor: '#ff5252', borderWidth: 1, borderRadius: 10, padding: 14, gap: 8 },
   faultTitle: { color: '#ff8a80', fontSize: 19, fontWeight: '900' },
   faultText: { color: 'white', fontSize: 16, lineHeight: 22 },

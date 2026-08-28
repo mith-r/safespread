@@ -33,6 +33,8 @@ describe('ARKit tracking eligibility', () => {
       kind: 'status',
       frameTimestampMs: 1250,
       emittedTimestampMs: 1250,
+      frameIntervalMs: 0,
+      thermalState: 'nominal',
       sequence: 42,
       trackingState: 'notAvailable',
       trackingReason: 'interrupted',

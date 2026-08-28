@@ -81,6 +81,21 @@ int main() {
            LANE, p.lengthFt, p.reversals);
   }
 
+  // The production maneuver starts only after the complete rover footprint is
+  // beyond the boundary, and chooses the smaller of the two exact K-turns.
+  {
+    const RoverFootprint footprint = {2.5f / 12.0f, 13.5f / 12.0f,
+                                      (19.5f / 30.48f) * 0.5f};
+    OutsideTurnPlan outside;
+    assert(planOutsideHeadlandTurn(21.0f / 12.0f, RL, RR, footprint, outside));
+    assert(outside.ok && outside.runoutFt > 0.0f);
+    const TurnEnvelope envelope = turnFootprintEnvelope(outside.turn, footprint);
+    assert(outside.runoutFt + envelope.minForwardFt >= -0.001f);
+    assert(std::fabs(outside.headlandFt -
+                     (outside.runoutFt + envelope.maxForwardFt +
+                      TURN_ENVELOPE_ALLOWANCE_FT)) < 0.001f);
+  }
+
   // --- the whole reachable range -----------------------------------------
   {
     for (float shift = -14.0f; shift <= 14.0f; shift += 0.13f) {

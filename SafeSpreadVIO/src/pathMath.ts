@@ -2,6 +2,54 @@ export interface PathPoint {
   x: number;
   y: number;
   spraying: boolean;
+  /** Recorded after ARKit moved the world, so it is not where it says it is. */
+  suspect?: boolean;
+}
+
+// The map is on screen for the whole run now, and the path only ever grows, so
+// it is drawn in fixed-size chunks: appending a point invalidates the last one
+// instead of all three thousand.
+export const PATH_CHUNK_SIZE = 200;
+
+export function pathChunks(points: PathPoint[], size = PATH_CHUNK_SIZE): PathPoint[][] {
+  if (size < 1) throw new RangeError('chunk size must be positive');
+  const chunks: PathPoint[][] = [];
+  for (let start = 0; start < points.length; start += size) {
+    chunks.push(points.slice(start, start + size));
+  }
+  return chunks;
+}
+
+/** Chunk a growing path, handing back the *same array instance* for every chunk
+ *  whose contents have not changed. Identity is the whole point: it is what lets
+ *  the map skip redrawing a chunk, and slicing afresh each time would produce
+ *  equal-but-new arrays that skip nothing.
+ *
+ *  A path is append-only until it reaches its cap and then becomes a sliding
+ *  window. Once it slides, every chunk holds different points than it did, so
+ *  the cache is dropped entirely -- detected by the first point no longer being
+ *  the same object. */
+export function createPathChunker(size = PATH_CHUNK_SIZE) {
+  if (size < 1) throw new RangeError('chunk size must be positive');
+  let firstPoint: PathPoint | undefined;
+  let chunks: PathPoint[][] = [];
+
+  return function chunk(points: PathPoint[]): PathPoint[][] {
+    const previous = points.length > 0 && firstPoint === points[0] ? chunks : [];
+    const next: PathPoint[][] = [];
+    for (let start = 0, index = 0; start < points.length; start += size, index += 1) {
+      const end = Math.min(start + size, points.length);
+      const cached = previous[index];
+      // Only a chunk that is already full is settled; a partial one is still
+      // being appended to and has to be rebuilt.
+      next.push(cached !== undefined && cached.length === size && end - start === size
+        ? cached
+        : points.slice(start, end));
+    }
+    firstPoint = points[0];
+    chunks = next;
+    return next;
+  };
 }
 
 /** Only keep a sample once the rover has actually moved, so a mission of any

@@ -9,23 +9,44 @@ struct RouteRequirements {
   bool truncated;
 };
 
-// Route arcs are sampled every 0.5 ft. At the smallest planned turn radius
-// (5.05 ft measured), an extremum between samples can
-// exceed both adjacent waypoints by just under 0.01 ft. Reserve that amount
-// whenever the route leaves an end of the rectangle so exact entered
-// clearance remains conservative for the continuous physical path.
-constexpr float ROUTE_EXTREMA_ALLOWANCE_FT = 0.01f;
+// Route arcs are sampled every 0.5 ft. Reserve the same allowance used by the
+// continuous turn-envelope calculation so a between-point extremum remains
+// conservative.
+constexpr float ROUTE_EXTREMA_ALLOWANCE_FT = TURN_ENVELOPE_ALLOWANCE_FT;
+
+inline float routeRoverHeadingDeg(const RoutePoint *route, int count, int index) {
+  int other = index;
+  if (index + 1 < count && route[index + 1].reverse == route[index].reverse) other = index + 1;
+  else if (index > 0 && route[index - 1].reverse == route[index].reverse) other = index - 1;
+  if (other == index) return 0.0f;
+  const int from = other > index ? index : other;
+  const int to = other > index ? other : index;
+  float heading = bearingToWaypointDeg(route[to].x - route[from].x,
+                                       route[to].y - route[from].y);
+  if (route[index].reverse) heading = fmodf(heading + 180.0f, 360.0f);
+  return heading;
+}
 
 inline RouteRequirements inspectRoute(const RoutePoint *route, int count,
                                       float passLengthFt) {
   RouteRequirements result = {0.0f, 0.0f, 0, true};
   if (route == nullptr || count <= 0 || passLengthFt <= 0.0f) return result;
 
-  float minY = route[0].y;
-  float maxY = route[0].y;
-  for (int index = 1; index < count; ++index) {
-    if (route[index].y < minY) minY = route[index].y;
-    if (route[index].y > maxY) maxY = route[index].y;
+  float minY = 1e9f;
+  float maxY = -1e9f;
+  for (int index = 0; index < count; ++index) {
+    const float heading = turnRad(routeRoverHeadingDeg(route, count, index));
+    const float forwards[2] = {-ROVER_FOOTPRINT.rearFt, ROVER_FOOTPRINT.frontFt};
+    const float rights[2] = {-ROVER_FOOTPRINT.halfWidthFt, ROVER_FOOTPRINT.halfWidthFt};
+    for (float forward : forwards) {
+      for (float right : rights) {
+        const float cornerY = route[index].y - right * sinf(heading) +
+                              forward * cosf(heading);
+        if (cornerY < minY) minY = cornerY;
+        if (cornerY > maxY) maxY = cornerY;
+      }
+    }
+    if (index == 0) continue;
     if (route[index].reverse != route[index - 1].reverse) result.reversals++;
   }
   const float sampledBefore = std::fmax(0.0f, -minY);

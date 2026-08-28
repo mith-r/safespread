@@ -1,5 +1,8 @@
 import {
   computeViewBox,
+  createPathChunker,
+  pathChunks,
+  PathPoint,
   projector,
   shouldRecord,
   MIN_SAMPLE_STEP_FT,
@@ -61,5 +64,58 @@ describe('projector', () => {
     const b = p.toPx(10, 0);
     // 10ft across should map to the smaller dimension, not stretch to 200px
     expect(b.left - a.left).toBeCloseTo(100);
+  });
+});
+
+describe('path chunking for the mission map', () => {
+  const point = (i: number): PathPoint => ({ x: i, y: i, spraying: false });
+
+  it('splits into fixed-size chunks that cover every point in order', () => {
+    const points = Array.from({ length: 7 }, (_, i) => point(i));
+    const chunks = pathChunks(points, 3);
+    expect(chunks.map((c) => c.length)).toEqual([3, 3, 1]);
+    expect(chunks.flat()).toEqual(points);
+  });
+
+  it('keeps settled chunks identical as the path grows, so the map can skip them', () => {
+    const chunk = createPathChunker(3);
+    const points: PathPoint[] = [];
+    for (let i = 0; i < 6; i += 1) points.push(point(i));
+
+    const first = chunk([...points]);
+    expect(first.map((c) => c.length)).toEqual([3, 3]);
+
+    // Append one point: the two full chunks must come back as the very same
+    // arrays, because identity is what React.memo compares.
+    points.push(point(6));
+    const second = chunk([...points]);
+    expect(second[0]).toBe(first[0]);
+    expect(second[1]).toBe(first[1]);
+    expect(second[2]).toEqual([point(6)]);
+  });
+
+  it('rebuilds a partial chunk until it fills up', () => {
+    const chunk = createPathChunker(3);
+    const a = chunk([point(0)]);
+    const b = chunk([point(0), point(1)]);
+    expect(b[0]).not.toBe(a[0]);
+    expect(b[0]).toHaveLength(2);
+  });
+
+  it('drops the cache when the path stops being append-only', () => {
+    const chunk = createPathChunker(3);
+    const points = Array.from({ length: 6 }, (_, i) => point(i));
+    const first = chunk(points);
+    // The path has hit its cap and is now a sliding window: every chunk holds
+    // different points than it did, so none of them may be reused.
+    const slid = [...points.slice(1), point(6)];
+    const second = chunk(slid);
+    expect(second[0]).not.toBe(first[0]);
+    expect(second.flat()).toEqual(slid);
+  });
+
+  it('handles an empty path', () => {
+    expect(createPathChunker(3)([])).toEqual([]);
+    expect(pathChunks([], 3)).toEqual([]);
   });
 });

@@ -36,9 +36,46 @@ public class ArkitPoseModule: Module {
 private class ArkitSessionDelegate: NSObject, ARSessionDelegate {
   private let onUpdate: ([String: Any]) -> Void
   private var sequence: UInt32 = 0
+  private var lastFrameTimestamp: TimeInterval?
+
+  // ARKit stopped delivering frames at 60 Hz partway through the 2026-08-28
+  // mission and decayed to 19 Hz by the end, which the rover eventually called
+  // a pose timeout. Nothing in the log said why, because nothing was recording
+  // the two things that would distinguish a throttled phone from a busy one:
+  // how hot iOS thinks it is, and how far apart the frames are actually
+  // arriving. Both are cheap and both are now on every pose.
+  //
+  // Thermal state is cached from its change notification rather than read per
+  // frame; it changes a handful of times an hour, not sixty times a second.
+  private var thermalState: String = ArkitSessionDelegate.name(
+    for: ProcessInfo.processInfo.thermalState)
 
   init(onUpdate: @escaping ([String: Any]) -> Void) {
     self.onUpdate = onUpdate
+    super.init()
+    NotificationCenter.default.addObserver(
+      self,
+      selector: #selector(thermalStateChanged),
+      name: ProcessInfo.thermalStateDidChangeNotification,
+      object: nil)
+  }
+
+  deinit {
+    NotificationCenter.default.removeObserver(self)
+  }
+
+  @objc private func thermalStateChanged() {
+    thermalState = ArkitSessionDelegate.name(for: ProcessInfo.processInfo.thermalState)
+  }
+
+  private static func name(for state: ProcessInfo.ThermalState) -> String {
+    switch state {
+    case .nominal: return "nominal"
+    case .fair: return "fair"
+    case .serious: return "serious"
+    case .critical: return "critical"
+    @unknown default: return "unknown"
+    }
   }
 
   func session(_ session: ARSession, didUpdate frame: ARFrame) {
@@ -87,6 +124,9 @@ private class ArkitSessionDelegate: NSObject, ARSessionDelegate {
     @unknown default: mappingStatus = "unknown"
     }
 
+    let frameIntervalMs = lastFrameTimestamp.map { (frame.timestamp - $0) * 1000.0 } ?? 0.0
+    lastFrameTimestamp = frame.timestamp
+
     sequence &+= 1
     onUpdate([
       "kind": "pose",
@@ -98,6 +138,8 @@ private class ArkitSessionDelegate: NSObject, ARSessionDelegate {
       "mappingStatus": mappingStatus,
       "frameTimestampMs": frame.timestamp * 1000.0,
       "emittedTimestampMs": ProcessInfo.processInfo.systemUptime * 1000.0,
+      "frameIntervalMs": frameIntervalMs,
+      "thermalState": thermalState,
       "sequence": sequence,
     ])
   }
@@ -126,6 +168,8 @@ private class ArkitSessionDelegate: NSObject, ARSessionDelegate {
       "mappingStatus": "notAvailable",
       "frameTimestampMs": ProcessInfo.processInfo.systemUptime * 1000.0,
       "emittedTimestampMs": ProcessInfo.processInfo.systemUptime * 1000.0,
+      "frameIntervalMs": 0.0,
+      "thermalState": thermalState,
       "sequence": sequence,
     ]
     if let error { payload["error"] = error }

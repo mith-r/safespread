@@ -3,8 +3,6 @@ import { File, Paths } from 'expo-file-system';
 import { useKeepAwake } from 'expo-keep-awake';
 import { setAudioModeAsync, useAudioPlayer } from 'expo-audio';
 import { SafeSpreadBLE } from './src/ble';
-import { CalibrationRecord, createCalibration } from './src/calibration';
-import { loadCalibration, saveCalibration } from './src/calibrationStore';
 import { LatestPoseSender } from './src/latestPoseSender';
 import { MissionCommandRefused, MissionControl } from './src/missionControl';
 import { missionJsonlToCsv } from './src/missionCsv';
@@ -18,10 +16,11 @@ import {
 } from './src/missionLog';
 import { MAX_PATH_POINTS, PathPoint, shouldRecord } from './src/pathMath';
 import { wrappedHeadingDelta } from './src/poseMath';
-import { buildPoseV2, FaultSampleV2, TelemetryV2 } from './src/protocolV2';
+import { ValidatedPose } from './src/posePipeline';
+import { buildPoseV2, FaultSampleV2, RoutePlanV2, TelemetryV2 } from './src/protocolV2';
 import { worldToRectangle } from './src/rectangle';
 import RunningMission from './src/RunningMission';
-import SetupWizard, { CalibrationFormValue } from './src/SetupWizard';
+import SetupWizard from './src/SetupWizard';
 import {
   assembleFaultPackets,
   initialSetupState,
@@ -31,11 +30,16 @@ import {
 } from './src/setupMachine';
 import { DEFAULT_MOUNT_CALIBRATION, useVIOPose } from './src/useVIOPose';
 
-const HARDWARE_TAG = 'safespread-rover-a';
 const APP_VERSION = '1.0.0';
 const FIRMWARE_VERSION = 'protocol-v2-acknowledged';
 const START_POSITION_TOLERANCE_FT = 0.75;
 const START_HEADING_TOLERANCE_DEG = 5;
+// How far ARKit may move the world before it is worth telling the operator, and
+// before continuing to spray is worse than stopping. The 2026-08-28 mission took
+// a single 1.11 ft shift mid-headland; every lane after it was a foot off the
+// ground it was supposed to cover, and no number on board said so.
+const RELOCALIZATION_WARN_FT = 0.3;
+const RELOCALIZATION_FAULT_FT = 1.0;
 const ble = new SafeSpreadBLE();
 
 function faultName(code: number): string {
@@ -67,34 +71,37 @@ export default function App() {
   const [setup, dispatch] = useReducer(setupReducer, undefined, initialSetupState);
   const setupRef = useRef(setup);
   setupRef.current = setup;
-  const [calibration, setCalibration] = useState<CalibrationRecord | null>(null);
-  const mountCalibration = calibration ?? DEFAULT_MOUNT_CALIBRATION;
   // Every refused pose is a pose the rover never sees. Record them -- the first
   // of each cause immediately, then once a second per cause so a long tracking
   // outage annotates the log instead of filling it.
   const rejectLoggedAtRef = useRef<Partial<Record<string, number>>>({});
-  const vio = useVIOPose(mountCalibration, (rejection) => {
-    const now = Date.now();
-    const previous = rejectLoggedAtRef.current[rejection.reason];
-    if (previous !== undefined && now - previous < 1000) return;
-    rejectLoggedAtRef.current[rejection.reason] = now;
-    recordLog({
-      type: 'pose_reject',
-      phoneMs: now,
-      sequence: rejection.sequence,
-      reason: rejection.reason,
-      frameTimestampMs: rejection.frameTimestampMs,
-      trackingState: rejection.trackingState,
-      trackingReason: rejection.trackingReason,
-      reasonCount: rejection.count,
-      rejectedTotal: rejection.total,
-    });
+  const vio = useVIOPose(DEFAULT_MOUNT_CALIBRATION, {
+    onPose: (pose) => onValidatedPose(pose),
+    onReject: (rejection) => {
+      const now = Date.now();
+      const previous = rejectLoggedAtRef.current[rejection.reason];
+      if (previous !== undefined && now - previous < 1000) return;
+      rejectLoggedAtRef.current[rejection.reason] = now;
+      recordLog({
+        type: 'pose_reject',
+        phoneMs: now,
+        sequence: rejection.sequence,
+        reason: rejection.reason,
+        frameTimestampMs: rejection.frameTimestampMs,
+        trackingState: rejection.trackingState,
+        trackingReason: rejection.trackingReason,
+        reasonCount: rejection.count,
+        rejectedTotal: rejection.total,
+      });
+    },
   });
   const trackingOkRef = useRef(vio.trackingOk);
   trackingOkRef.current = vio.trackingOk;
   const [busy, setBusy] = useState(false);
   const [operationError, setOperationError] = useState<string | null>(null);
-  const [calibrationProgress, setCalibrationProgress] = useState('');
+  const [diagnosticProgress, setDiagnosticProgress] = useState('');
+  const [turnRadii, setTurnRadii] = useState<{ leftFt: number; rightFt: number; measured: boolean } | null>(null);
+  const [routePlan, setRoutePlan] = useState<RoutePlanV2 | null>(null);
   const [recentLogs, setRecentLogs] = useState<MissionLogFile[]>([]);
   const [telemetry, setTelemetry] = useState<TelemetryV2 | null>(null);
   const telemetryRef = useRef<TelemetryV2 | null>(null);
@@ -107,15 +114,17 @@ export default function App() {
   const [path, setPath] = useState<PathPoint[]>([]);
   const [logName, setLogName] = useState<string | null>(null);
   const [faultDumpUri, setFaultDumpUri] = useState<string | null>(null);
+  const [relocalizationShiftFt, setRelocalizationShiftFt] = useState(0);
+  const relocalizationShiftFtRef = useRef(0);
 
   const controlRef = useRef<MissionControl | null>(null);
   const senderRef = useRef<LatestPoseSender | null>(null);
   const loggerRef = useRef<MissionLogger | null>(null);
   const epochRef = useRef<number | null>(null);
-  const calibrationWireRef = useRef<CalibrationRecord | typeof DEFAULT_MOUNT_CALIBRATION | null>(null);
+  const geometryWireRef = useRef<typeof DEFAULT_MOUNT_CALIBRATION | null>(null);
   const poseStreamingRef = useRef(false);
   const rectangleConfiguredRef = useRef(false);
-  const calibrationPreparedRef = useRef(false);
+  const sessionPreparedRef = useRef(false);
   const resourceWetRef = useRef<boolean | null>(null);
   const resourceHasRectangleRef = useRef(false);
   const lastPoseOfferedSequenceRef = useRef(0);
@@ -123,7 +132,7 @@ export default function App() {
   const faultPacketsRef = useRef<Uint8Array[]>([]);
   const faultHandledRef = useRef(false);
   const bootFaultSummaryRef = useRef<string | null>(null);
-  const calibrationWaiterRef = useRef<{
+  const radiusWaiterRef = useRef<{
     resolve(message: string): void;
     reject(error: Error): void;
     timer: ReturnType<typeof setTimeout>;
@@ -163,11 +172,11 @@ export default function App() {
   function cancelActiveMissionOperation(): Promise<void> | null {
     const pending = activeOperationSettledRef.current;
     operationGateRef.current.cancel();
-    const calibrationWaiter = calibrationWaiterRef.current;
-    if (calibrationWaiter) {
-      clearTimeout(calibrationWaiter.timer);
-      calibrationWaiterRef.current = null;
-      calibrationWaiter.resolve('Calibration cancelled by Stop');
+    const radiusWaiter = radiusWaiterRef.current;
+    if (radiusWaiter) {
+      clearTimeout(radiusWaiter.timer);
+      radiusWaiterRef.current = null;
+      radiusWaiter.resolve('Radius measurement cancelled by Stop');
     }
     const selfTestWaiter = selfTestWaiterRef.current;
     if (selfTestWaiter) {
@@ -203,9 +212,9 @@ export default function App() {
     controlRef.current?.dispose();
     controlRef.current = null;
     epochRef.current = null;
-    calibrationWireRef.current = null;
+    geometryWireRef.current = null;
     rectangleConfiguredRef.current = false;
-    calibrationPreparedRef.current = false;
+    sessionPreparedRef.current = false;
     resourceWetRef.current = null;
     resourceHasRectangleRef.current = false;
     poseBySequenceRef.current.clear();
@@ -235,7 +244,7 @@ export default function App() {
       dispatch({ type: 'SET_LOGGING_READY', ready: false });
     }
     const epoch = await nextMissionEpoch();
-    const wire = calibration ?? DEFAULT_MOUNT_CALIBRATION;
+    const wire = DEFAULT_MOUNT_CALIBRATION;
     const missionId = `${new Date().toISOString().replace(/[:.]/g, '-')}-e${epoch}`;
     try {
       const fileLog = await createFileLogSink(missionId);
@@ -249,7 +258,7 @@ export default function App() {
         calibrationId: wire.id,
         calibrationSchemaVersion: wire.schemaVersion,
         pavement: {
-          surface: calibration?.surface ?? 'other',
+          surface: 'other',
           condition: setup.wet ? 'wet' : 'dry',
         },
         rectangle: setup.rectangle ? {
@@ -269,7 +278,6 @@ export default function App() {
     }
     const control = new MissionControl(ble, epoch, () => trackingOkRef.current, {
       dryMode: !setup.wet,
-      preferForwardOnly: true,
     });
     const sender = new LatestPoseSender(ble, (error) => {
       void handleMissionFault(`pose transport failed: ${error.message}`);
@@ -277,19 +285,21 @@ export default function App() {
     controlRef.current = control;
     senderRef.current = sender;
     epochRef.current = epoch;
-    calibrationWireRef.current = wire;
+    geometryWireRef.current = wire;
     poseStreamingRef.current = true;
     // A mission's first pose must use the same frame as every later pose.
     // Otherwise Configure changes world coordinates into rectangle coordinates
     // and the rover correctly interprets the discontinuity as a pose jump.
     rectangleConfiguredRef.current = !!setup.rectangle;
-    calibrationPreparedRef.current = false;
+    sessionPreparedRef.current = false;
     resourceWetRef.current = setup.wet;
     resourceHasRectangleRef.current = !!setup.rectangle;
     faultHandledRef.current = false;
     faultPacketsRef.current = [];
     setFaultDumpUri(null);
     setPath([]);
+    relocalizationShiftFtRef.current = 0;
+    setRelocalizationShiftFt(0);
     return { control, epoch };
   }
 
@@ -372,16 +382,6 @@ export default function App() {
   }, [setup.wet, telemetry?.flags]);
 
   useEffect(() => {
-    void loadCalibration(HARDWARE_TAG).then((result) => {
-      setCalibration(result.calibration);
-      dispatch({
-        type: 'SET_CALIBRATION_STATUS',
-        status: result.reason === 'ready' ? 'ready' : result.reason === 'missing' ? 'missing' : 'stale',
-      });
-    }).catch((error) => {
-      setOperationError(`Calibration load failed: ${error instanceof Error ? error.message : String(error)}`);
-      dispatch({ type: 'SET_CALIBRATION_STATUS', status: 'stale' });
-    });
     refreshLogs();
   }, []);
 
@@ -445,18 +445,28 @@ export default function App() {
         if (line.startsWith('[BOOT FAULT]') || line.startsWith('[FAULT SUMMARY]')) {
           bootFaultSummaryRef.current = line;
         }
-        if (line.startsWith('[CAL')) {
-          setCalibrationProgress(line);
-          const waiter = calibrationWaiterRef.current;
-          if (waiter && (line.startsWith('[CAL PASS]') || line.startsWith('[CAL SAMPLE]') || line.startsWith('[CAL FAIL]'))) {
+        if (line.startsWith('[RADIUS')) {
+          setDiagnosticProgress(line);
+          const measured = line.match(
+            /^\[RADIUS (?:STATUS|PASS)\] left=([0-9.]+) right=([0-9.]+) ft(?: source=(measured|built-in))?/,
+          );
+          if (measured) {
+            setTurnRadii({
+              leftFt: Number.parseFloat(measured[1]),
+              rightFt: Number.parseFloat(measured[2]),
+              measured: line.startsWith('[RADIUS PASS]') || measured[3] === 'measured',
+            });
+          }
+          const waiter = radiusWaiterRef.current;
+          if (waiter && (line.startsWith('[RADIUS PASS]') || line.startsWith('[RADIUS FAIL]'))) {
             clearTimeout(waiter.timer);
-            calibrationWaiterRef.current = null;
-            if (line.startsWith('[CAL FAIL]')) waiter.reject(new Error(line));
+            radiusWaiterRef.current = null;
+            if (line.startsWith('[RADIUS FAIL]')) waiter.reject(new Error(line));
             else waiter.resolve(line);
           }
         }
         if (line.startsWith('=== SELF TEST')) {
-          setCalibrationProgress(line);
+          setDiagnosticProgress(line);
           const waiter = selfTestWaiterRef.current;
           if (waiter && (line.includes('COMPLETE') || line.includes('FAILED') ||
               line.includes('ABORTED') || line.includes('STOPPED'))) {
@@ -494,20 +504,51 @@ export default function App() {
     });
   }, [vio.trackingOk, vio.readiness.ready, atStart]);
 
-  useEffect(() => {
-    const validated = vio.validatedPose;
+  /** Every accepted pose, on the ARKit frame that produced it. This runs
+   *  outside React's render cycle on purpose: the rover's freshness budget is
+   *  250 ms end to end, and waiting for the mission map to redraw before
+   *  putting a pose on the wire is how that budget gets spent. */
+  function onValidatedPose(validated: ValidatedPose) {
     const sender = senderRef.current;
     const epoch = epochRef.current;
-    const wire = calibrationWireRef.current;
+    const wire = geometryWireRef.current;
     const rectangle = setupRef.current.rectangle;
-    if (!validated || !sender || epoch === null || !wire || !rectangle ||
-        !poseStreamingRef.current || !vio.trackingOk) return;
-    const roverPose = rectangleConfiguredRef.current
+
+    // ARKit moved the world out from under the rover. The pipeline has already
+    // absorbed the jump so the pose stream stays continuous, which is right for
+    // control and quietly wrong for coverage: every lane laid down afterwards
+    // is offset by that much on real ground while cross-track error still reads
+    // clean. Small shifts are worth knowing about; a large one means the rover
+    // no longer knows where the field is and must not keep spraying.
+    if (validated.relocalizationShiftFt >= RELOCALIZATION_WARN_FT) {
+      relocalizationShiftFtRef.current += validated.relocalizationShiftFt;
+      setRelocalizationShiftFt(relocalizationShiftFtRef.current);
+      recordLog({
+        type: 'relocalization',
+        phoneMs: Date.now(),
+        sequence: validated.sequence,
+        shiftFt: validated.relocalizationShiftFt,
+        accumulatedShiftFt: relocalizationShiftFtRef.current,
+        accumulatedWorldOffsetXFt: validated.accumulatedWorldOffsetXFt,
+        accumulatedWorldOffsetYFt: validated.accumulatedWorldOffsetYFt,
+        mappingStatus: validated.mappingStatus,
+      });
+      if (validated.relocalizationShiftFt >= RELOCALIZATION_FAULT_FT &&
+          setupRef.current.phase === 'running') {
+        void handleMissionFault(
+          `ARKit moved the world ${validated.relocalizationShiftFt.toFixed(2)} ft; ` +
+          'the rover no longer knows where the rectangle is.');
+        return;
+      }
+    }
+
+    if (!sender || epoch === null || !wire || !poseStreamingRef.current) return;
+    const roverPose = rectangleConfiguredRef.current && rectangle
       ? worldToRectangle(validated.rover, rectangle)
       : validated.rover;
     const ageMs = Math.max(0, validated.captureAgeMs +
       (globalThis.performance?.now() ?? Date.now()) - validated.receivedAtMs);
-    const yawRate = rectangleConfiguredRef.current && rectangle.side === 'left'
+    const yawRate = rectangleConfiguredRef.current && rectangle?.side === 'left'
       ? -validated.yawRateDps
       : validated.yawRateDps;
     try {
@@ -543,13 +584,18 @@ export default function App() {
         roverWorldYFt: validated.rover.y,
         sprayWorldXFt: validated.sprayBar.x,
         sprayWorldYFt: validated.sprayBar.y,
-        trackingState: vio.trackingState,
-        trackingReason: vio.trackingReason,
-        mappingStatus: vio.mappingStatus,
+        trackingState: validated.trackingState,
+        trackingReason: validated.trackingReason,
+        mappingStatus: validated.mappingStatus,
         senderDropped: sender.dropped,
         relocalizationShiftFt: validated.relocalizationShiftFt,
         accumulatedWorldOffsetXFt: validated.accumulatedWorldOffsetXFt,
         accumulatedWorldOffsetYFt: validated.accumulatedWorldOffsetYFt,
+        // How fast ARKit is actually delivering, and how hot iOS thinks the
+        // phone is. A pose stream that thins out over a long run ends as a
+        // rover-side pose timeout, and these are what say why.
+        frameIntervalMs: validated.frameIntervalMs,
+        thermalState: validated.thermalState,
       };
       poseBySequenceRef.current.set(validated.sequence, poseRecord);
       while (poseBySequenceRef.current.size > 256) {
@@ -563,6 +609,10 @@ export default function App() {
           x: roverPose.x,
           y: roverPose.y,
           spraying: Boolean(telemetryRef.current && (telemetryRef.current.flags & 1)),
+          // Everything laid down after the world moved sits somewhere other
+          // than where this says it does. Mark it so the map does not present
+          // suspect coverage in the same colour as coverage that can be trusted.
+          suspect: relocalizationShiftFtRef.current >= RELOCALIZATION_WARN_FT,
         };
         setPath((previous) => shouldRecord(previous.at(-1), nextPoint)
           ? [...previous.slice(-(MAX_PATH_POINTS - 1)), nextPoint]
@@ -571,58 +621,30 @@ export default function App() {
     } catch (error) {
       void handleMissionFault(`pose packet failed: ${error instanceof Error ? error.message : String(error)}`);
     }
-  }, [vio.validatedPose, vio.trackingOk]);
-
-  async function onSaveCalibration(value: CalibrationFormValue) {
-    setBusy(true);
-    setOperationError(null);
-    try {
-      if (controlRef.current) {
-        await controlRef.current.stop().catch(() => {});
-        await releaseMissionResources(true);
-      }
-      const record = createCalibration({
-        schemaVersion: 1,
-        hardwareTag: HARDWARE_TAG,
-        createdAtIso: new Date().toISOString(),
-        ...value,
-        condition: setup.wet ? 'wet' : 'dry',
-      });
-      await saveCalibration(record, HARDWARE_TAG);
-      setCalibration(record);
-      dispatch({ type: 'SET_CALIBRATION_STATUS', status: 'ready' });
-      setCalibrationProgress(`Phone calibration ${record.id} saved. Run dry steering, speed, and reverse checks for this ID.`);
-    } catch (error) {
-      setOperationError(error instanceof Error ? error.message : String(error));
-      dispatch({ type: 'SET_CALIBRATION_STATUS', status: 'stale' });
-    } finally {
-      setBusy(false);
-    }
   }
 
-  function awaitCalibrationResult(): Promise<string> {
+  function awaitRadiusResult(): Promise<string> {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
-        calibrationWaiterRef.current = null;
-        reject(new Error('Calibration result timeout; Stop and inspect rover logs.'));
-      }, 25000);
-      calibrationWaiterRef.current = { resolve, reject, timer };
+        radiusWaiterRef.current = null;
+        reject(new Error('Radius measurement timed out; press Stop and inspect the rover.'));
+      }, 120000);
+      radiusWaiterRef.current = { resolve, reject, timer };
     });
   }
 
-  async function onRunCalibration(opcode: 5 | 6 | 7) {
+  async function onMeasureTurningRadii() {
     const operation = beginMissionOperation();
     setBusy(true);
     setOperationError(null);
     try {
-      if (setup.wet) throw new Error('Select Dry diagnostic before any calibration movement.');
-      if (!calibration) throw new Error('Save mount and pavement calibration before motion calibration.');
-      const { control } = await ensureMissionResources();
+      if (setup.wet) throw new Error('Select Dry diagnostic before measuring turning radii.');
+      const { control } = await ensureMissionResources({ requireRectangle: false });
       operationGateRef.current.assertCurrent(operation.generation);
-      if (!calibrationPreparedRef.current) {
-        await control.prepareCalibration(calibration);
+      if (!sessionPreparedRef.current) {
+        await control.prepareDiagnostics(DEFAULT_MOUNT_CALIBRATION);
         operationGateRef.current.assertCurrent(operation.generation);
-        calibrationPreparedRef.current = true;
+        sessionPreparedRef.current = true;
       }
       const beforeSequence = lastPoseOfferedSequenceRef.current;
       const deadline = Date.now() + 750;
@@ -630,17 +652,17 @@ export default function App() {
         await new Promise((resolve) => setTimeout(resolve, 20));
         operationGateRef.current.assertCurrent(operation.generation);
       }
-      const result = awaitCalibrationResult();
+      const result = awaitRadiusResult();
       try {
-        await control.runCalibrationStep(opcode);
+        await control.measureTurningRadii();
         operationGateRef.current.assertCurrent(operation.generation);
-        setCalibrationProgress(await result);
+        setDiagnosticProgress(await result);
         operationGateRef.current.assertCurrent(operation.generation);
       } catch (error) {
-        const waiter = calibrationWaiterRef.current;
+        const waiter = radiusWaiterRef.current;
         if (waiter) {
           clearTimeout(waiter.timer);
-          calibrationWaiterRef.current = null;
+          radiusWaiterRef.current = null;
         }
         throw error;
       }
@@ -659,13 +681,12 @@ export default function App() {
     setOperationError(null);
     try {
       if (setup.wet) throw new Error('Select Dry diagnostic before the self-test.');
-      if (!calibration) throw new Error('Save mount and pavement calibration before the self-test.');
       const { control } = await ensureMissionResources({ requireRectangle: false });
       operationGateRef.current.assertCurrent(operation.generation);
-      if (!calibrationPreparedRef.current) {
-        await control.prepareCalibration(calibration);
+      if (!sessionPreparedRef.current) {
+        await control.prepareDiagnostics(DEFAULT_MOUNT_CALIBRATION);
         operationGateRef.current.assertCurrent(operation.generation);
-        calibrationPreparedRef.current = true;
+        sessionPreparedRef.current = true;
       }
       const result = new Promise<string>((resolve, reject) => {
         const timer = setTimeout(() => {
@@ -677,7 +698,7 @@ export default function App() {
       try {
         await control.selfTest();
         operationGateRef.current.assertCurrent(operation.generation);
-        setCalibrationProgress(await result);
+        setDiagnosticProgress(await result);
         operationGateRef.current.assertCurrent(operation.generation);
       } catch (error) {
         const waiter = selfTestWaiterRef.current;
@@ -712,9 +733,17 @@ export default function App() {
       }
       dispatch({ type: 'REQUEST_ARM' });
       if (!setup.rectangle) throw new Error('Rectangle is missing.');
-      const wire = calibration ?? DEFAULT_MOUNT_CALIBRATION;
+      const wire = DEFAULT_MOUNT_CALIBRATION;
       await control.configure(setup.rectangle, wire, setup.resumePassIndex);
       operationGateRef.current.assertCurrent(operation.generation);
+      const planned = control.routePlan;
+      if (!planned) throw new Error('The rover did not report its calculated headland.');
+      setRoutePlan(planned);
+      setTurnRadii((current) => ({
+        leftFt: planned.leftRadiusFt,
+        rightFt: planned.rightRadiusFt,
+        measured: current?.measured ?? false,
+      }));
       rectangleConfiguredRef.current = true;
       const currentReadiness = setupRef.current.readiness;
       // A resumed mission starts on a lane in the middle of the rectangle, so
@@ -804,6 +833,9 @@ export default function App() {
       setPath([]);
       passesStartedRef.current = 0;
       setPassesStarted(0);
+      relocalizationShiftFtRef.current = 0;
+      setRelocalizationShiftFt(0);
+      setRoutePlan(null);
       sprayingRef.current = false;
       setBusy(false);
     }
@@ -833,9 +865,17 @@ export default function App() {
   // Say when poses are being dropped and why. A silent pose stream and a
   // rejected pose stream both end as a rover-side pose timeout, and only this
   // line tells the operator which one they have.
-  const trackingDetail = vio.rejectSummary.total === 0
+  let trackingDetail = vio.rejectSummary.total === 0
     ? trackingBase
     : `${trackingBase} · ${vio.rejectSummary.total} poses dropped (last: ${vio.rejectSummary.lastReason})`;
+  // Say it before it becomes a pose timeout. A frame gap approaching the
+  // rover's 250 ms freshness budget is the whole failure in advance.
+  if (vio.thermalState !== 'nominal' && vio.thermalState !== 'unknown') {
+    trackingDetail += ` · phone ${vio.thermalState}`;
+  }
+  if (vio.worstFrameIntervalMs > 100) {
+    trackingDetail += ` · ARKit gap ${vio.worstFrameIntervalMs.toFixed(0)} ms`;
+  }
   const showMission = Boolean(setup.rectangle && ['running', 'complete', 'fault'].includes(setup.phase));
 
   if (showMission && setup.rectangle) {
@@ -847,9 +887,11 @@ export default function App() {
         telemetry={telemetry}
         rectangle={setup.rectangle}
         path={path}
+        routePlan={routePlan}
         fault={setup.fault ?? operationError}
         logName={logName}
         faultDumpReady={Boolean(faultDumpUri)}
+        relocalizationShiftFt={relocalizationShiftFt}
         busy={busy}
         currentPassIndex={setup.resumePassIndex + Math.max(0, passesStarted - 1)}
         onStop={onStop}
@@ -867,13 +909,13 @@ export default function App() {
       roverPose={vio.pose}
       trackingDetail={trackingDetail}
       readinessReason={vio.readiness.reason}
-      calibration={calibration}
+      turnRadii={turnRadii}
+      routePlan={routePlan}
       recentLogs={recentLogs}
       busy={busy}
-      calibrationProgress={operationError ?? calibrationProgress}
+      diagnosticProgress={operationError ?? diagnosticProgress}
       dispatch={dispatch}
-      onSaveCalibration={onSaveCalibration}
-      onRunCalibration={onRunCalibration}
+      onMeasureTurningRadii={onMeasureTurningRadii}
       onSelfTest={onSelfTest}
       onArm={onArm}
       onStart={onStart}

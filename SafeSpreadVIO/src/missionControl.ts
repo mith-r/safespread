@@ -4,6 +4,7 @@ import {
   buildCommandV2,
   buildRectangleV2,
   parseAckV2,
+  RoutePlanV2,
 } from './protocolV2';
 import { RectangleDefinition } from './rectangle';
 
@@ -18,6 +19,7 @@ export interface MissionTransport {
   writeWithResponse(packet: Uint8Array): Promise<void>;
   writeCompatibilityStop(): Promise<void>;
   subscribeAck(listener: (packet: Uint8Array) => void): () => void;
+  subscribeRoutePlan(listener: (plan: RoutePlanV2) => void): () => void;
 }
 
 export type MissionClientState = 'idle' | 'configured' | 'armed' | 'running' | 'complete' | 'fault';
@@ -26,7 +28,6 @@ interface MissionControlOptions {
   timeoutMs?: number;
   retries?: number;
   dryMode?: boolean;
-  preferForwardOnly?: boolean;
 }
 
 interface PendingAck {
@@ -60,12 +61,13 @@ export class MissionControl {
   private pending: PendingAck | null = null;
   private busy = false;
   private readonly unsubscribe: () => void;
+  private readonly unsubscribeRoutePlan: () => void;
   private readonly timeoutMs: number;
   private readonly retries: number;
   private readonly dryMode: boolean;
-  private readonly preferForwardOnly: boolean;
   private calibrationId = 0;
   private preparedCalibration: CalibrationWire | null = null;
+  private receivedRoutePlan: RoutePlanV2 | null = null;
   private operationGeneration = 0;
 
   constructor(
@@ -80,12 +82,18 @@ export class MissionControl {
     this.timeoutMs = options.timeoutMs ?? 750;
     this.retries = options.retries ?? 2;
     this.dryMode = options.dryMode ?? true;
-    this.preferForwardOnly = options.preferForwardOnly ?? true;
     this.unsubscribe = transport.subscribeAck((packet) => this.receiveAck(packet));
+    this.unsubscribeRoutePlan = transport.subscribeRoutePlan((plan) => {
+      if (plan.epoch === this.epoch) this.receivedRoutePlan = plan;
+    });
   }
 
   get state(): MissionClientState {
     return this.currentState;
+  }
+
+  get routePlan(): RoutePlanV2 | null {
+    return this.receivedRoutePlan;
   }
 
   /** `startPassIndex` resumes a faulted mission on a later pass; zero drives
@@ -114,27 +122,31 @@ export class MissionControl {
       }
 
       const rectangleCommandId = this.takeCommandId();
+      this.receivedRoutePlan = null;
       const flags = (definition.side === 'left' ? 1 : 0) |
-        (this.dryMode ? 2 : 0) |
-        (this.preferForwardOnly ? 4 : 0);
+        (this.dryMode ? 2 : 0);
       const rectangleAck = await this.sendAndWait(buildRectangleV2({
         flags,
         epoch: this.epoch,
         commandId: rectangleCommandId,
         mFt: definition.mFt,
         nFt: definition.nFt,
-        startClearFt: definition.startClearFt,
-        endClearFt: definition.endClearFt,
+        // Protocol-v2 retains these two fields for wire compatibility. The
+        // rover now computes the exact required headland from its measured
+        // radii and footprint; the operator no longer supplies either value.
+        startClearFt: 0,
+        endClearFt: 0,
         calibrationId: calibration.id,
         startPassIndex,
       }), rectangleCommandId, generation);
       this.requireAck(rectangleAck, [1], calibration.id);
+      await this.waitForRoutePlan(generation);
       this.currentState = 'configured';
       return rectangleAck;
     });
   }
 
-  async prepareCalibration(calibration: CalibrationWire): Promise<AckV2> {
+  async prepareDiagnostics(calibration: CalibrationWire): Promise<AckV2> {
     if (this.currentState !== 'idle') throw new Error('mission must be idle before calibration setup');
     return this.exclusive(async (generation) => {
       this.calibrationId = calibration.id;
@@ -154,13 +166,13 @@ export class MissionControl {
     });
   }
 
-  async runCalibrationStep(opcode: 5 | 6 | 7): Promise<AckV2> {
-    if (!this.dryMode) throw new Error('calibration motion is dry-only');
+  async measureTurningRadii(): Promise<AckV2> {
+    if (!this.dryMode) throw new Error('turn-radius measurement is dry-only');
     if (this.currentState !== 'idle' || !this.preparedCalibration) {
-      throw new Error('calibration must be prepared while idle');
+      throw new Error('diagnostics must be prepared while idle');
     }
-    if (!this.hasFreshPose()) throw new Error('a fresh valid pose is required for calibration');
-    return this.command(opcode, [0], 'idle');
+    if (!this.hasFreshPose()) throw new Error('a fresh valid pose is required for radius measurement');
+    return this.command(5, [0], 'idle');
   }
 
   async selfTest(): Promise<AckV2> {
@@ -211,6 +223,32 @@ export class MissionControl {
 
   dispose(): void {
     this.unsubscribe();
+    this.unsubscribeRoutePlan();
+  }
+
+  private waitForRoutePlan(generation: number): Promise<RoutePlanV2> {
+    if (this.receivedRoutePlan) return Promise.resolve(this.receivedRoutePlan);
+    return new Promise((resolve, reject) => {
+      const startedAt = Date.now();
+      const poll = () => {
+        try {
+          this.ensureCurrent(generation);
+        } catch (error) {
+          reject(error);
+          return;
+        }
+        if (this.receivedRoutePlan) {
+          resolve(this.receivedRoutePlan);
+          return;
+        }
+        if (Date.now() - startedAt >= this.timeoutMs) {
+          reject(new Error('route plan report timeout'));
+          return;
+        }
+        setTimeout(poll, 10);
+      };
+      poll();
+    });
   }
 
   private async command(

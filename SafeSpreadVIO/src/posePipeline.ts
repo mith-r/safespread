@@ -1,4 +1,10 @@
-import { PoseUpdatePayload } from '../modules/arkit-pose/src/ArkitPose.types';
+import {
+  MappingStatus,
+  PoseUpdatePayload,
+  ThermalState,
+  TrackingReason,
+  TrackingState,
+} from '../modules/arkit-pose/src/ArkitPose.types';
 import {
   cameraToRover,
   MountCalibration,
@@ -36,6 +42,17 @@ export interface ValidatedPose {
   relocalizationShiftFt: number;
   accumulatedWorldOffsetXFt: number;
   accumulatedWorldOffsetYFt: number;
+  /** Carried through from ARKit so the mission log can say whether a thinning
+   *  pose stream was the phone throttling or the app falling behind. */
+  frameIntervalMs: number;
+  thermalState: ThermalState;
+  // The tracking metadata belonging to this exact frame. An accepted pose is
+  // handed straight to the rover without waiting for React to re-render, so
+  // anything describing it has to travel with it rather than being read back
+  // out of component state that may still be showing an older frame.
+  trackingState: TrackingState;
+  trackingReason: TrackingReason;
+  mappingStatus: MappingStatus;
 }
 
 export type PoseDecision =
@@ -261,6 +278,11 @@ export class PosePipeline {
       relocalizationShiftFt,
       accumulatedWorldOffsetXFt: this.worldOffsetXFt,
       accumulatedWorldOffsetYFt: this.worldOffsetYFt,
+      frameIntervalMs: event.frameIntervalMs,
+      thermalState: event.thermalState,
+      trackingState: event.trackingState,
+      trackingReason: event.trackingReason,
+      mappingStatus: event.mappingStatus,
     };
 
     this.motionSamples = candidates;

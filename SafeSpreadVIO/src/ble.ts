@@ -7,7 +7,9 @@ import {
   FaultSampleV2,
   parseAckV2,
   parseFaultSampleV2,
+  parseRoutePlanV2,
   parseTelemetryV2,
+  RoutePlanV2,
   TelemetryV2,
 } from './protocolV2';
 import { MissionTransport } from './missionControl';
@@ -31,6 +33,7 @@ export class SafeSpreadBLE implements PoseTransport, MissionTransport {
   private logListener: ((line: string) => void) | null = null;
   private ackListeners = new Set<(packet: Uint8Array) => void>();
   private telemetryListeners = new Set<(telemetry: TelemetryV2) => void>();
+  private routePlanListeners = new Set<(plan: RoutePlanV2) => void>();
   private faultSampleListeners = new Set<(sample: FaultSampleV2) => void>();
   private faultPacketListeners = new Set<(packet: Uint8Array) => void>();
   private disconnectListeners = new Set<() => void>();
@@ -180,6 +183,11 @@ export class SafeSpreadBLE implements PoseTransport, MissionTransport {
     return () => this.telemetryListeners.delete(listener);
   }
 
+  subscribeRoutePlan(listener: (plan: RoutePlanV2) => void): Remove {
+    this.routePlanListeners.add(listener);
+    return () => this.routePlanListeners.delete(listener);
+  }
+
   subscribeFaultSamples(listener: (sample: FaultSampleV2) => void): Remove {
     this.faultSampleListeners.add(listener);
     return () => this.faultSampleListeners.delete(listener);
@@ -268,6 +276,11 @@ export class SafeSpreadBLE implements PoseTransport, MissionTransport {
       const telemetry = parseTelemetryV2(bytes);
       if (telemetry) {
         for (const listener of this.telemetryListeners) listener(telemetry);
+        return;
+      }
+      const plan = parseRoutePlanV2(bytes);
+      if (plan) {
+        for (const listener of this.routePlanListeners) listener(plan);
         return;
       }
       const sample = parseFaultSampleV2(bytes);

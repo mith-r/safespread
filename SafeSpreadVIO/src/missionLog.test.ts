@@ -1,4 +1,5 @@
 import {
+  batchedLogSink,
   exportMissionLog,
   listMissionLogs,
   LogSink,
@@ -96,6 +97,82 @@ describe('MissionLogger', () => {
     await Promise.all([write, close]);
     expect(closed).toBe(true);
     await expect(logger.record({ type: 'pose', phoneMs: 2 })).rejects.toThrow('closed');
+  });
+});
+
+describe('batchedLogSink', () => {
+  function recordingSink() {
+    const writes: string[] = [];
+    let closed = false;
+    return {
+      writes,
+      get closed() { return closed; },
+      sink: {
+        async append(text: string) { writes.push(text); },
+        async close() { closed = true; },
+      } as LogSink,
+    };
+  }
+
+  it('coalesces many records into one write without losing order or content', async () => {
+    const target = recordingSink();
+    let clock = 0;
+    const sink = batchedLogSink(target.sink, () => clock, 100, 1024);
+
+    for (let i = 0; i < 12; i += 1) {
+      clock += 5;                       // twelve records inside one interval
+      await sink.append(`line ${i}\n`);
+    }
+    expect(target.writes).toHaveLength(0);
+
+    clock += 100;
+    await sink.append('line 12\n');
+    expect(target.writes).toHaveLength(1);
+    expect(target.writes[0].split('\n').filter(Boolean)).toEqual(
+      Array.from({ length: 13 }, (_, i) => `line ${i}`),
+    );
+  });
+
+  it('flushes on size before the interval elapses', async () => {
+    const target = recordingSink();
+    const sink = batchedLogSink(target.sink, () => 0, 100, 20);
+    await sink.append('0123456789\n');
+    expect(target.writes).toHaveLength(0);
+    await sink.append('0123456789\n');
+    expect(target.writes).toEqual(['0123456789\n0123456789\n']);
+  });
+
+  it('writes the buffered tail on close, then closes the sink beneath it', async () => {
+    const target = recordingSink();
+    const sink = batchedLogSink(target.sink, () => 0, 100, 1024);
+    await sink.append('tail\n');
+    expect(target.writes).toHaveLength(0);
+    await sink.close();
+    expect(target.writes).toEqual(['tail\n']);
+    expect(target.closed).toBe(true);
+  });
+
+  it('fails the record whose flush failed, so the logger still latches it', async () => {
+    const failing: LogSink = {
+      async append() { throw new Error('disk full'); },
+      async close() {},
+    };
+    let clock = 0;
+    const sink = batchedLogSink(failing, () => clock, 100, 1024);
+    await sink.append('buffered\n');
+    clock += 100;
+    await expect(sink.append('flushes now\n')).rejects.toThrow('disk full');
+  });
+
+  it('a fault recorded and immediately closed still reaches the file', async () => {
+    const target = recordingSink();
+    const logger = await MissionLogger.create(metadata, batchedLogSink(target.sink, () => 0));
+    await logger.record({ type: 'pose', phoneMs: 1 });
+    await logger.record({ type: 'fault', phoneMs: 2, fault: 'pose timeout' });
+    await logger.close();
+
+    const lines = target.writes.join('').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    expect(lines.map((l) => l.type)).toEqual(['metadata', 'pose', 'fault']);
   });
 });
 

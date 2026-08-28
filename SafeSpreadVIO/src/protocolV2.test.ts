@@ -8,6 +8,7 @@ import {
   parseAckV2,
   parseFaultSampleV2,
   parsePoseV2,
+  parseRoutePlanV2,
   parseTelemetryV2,
   PoseV2,
 } from './protocolV2';
@@ -258,6 +259,29 @@ describe('protocol v2 inbound packets', () => {
       state: 5,
       faultCode: 2,
       droppedPackets: 3,
+    });
+  });
+
+  it('parses the measured radii and exact computed headland', () => {
+    const bytes = new Uint8Array(28);
+    const view = new DataView(bytes.buffer);
+    bytes.set([0x21, 0x52, 2, 2]);
+    view.setUint16(4, 7, true);
+    view.setUint16(6, 1200, true);
+    view.setUint16(8, 7, true);
+    view.setFloat32(10, 7.5, true);
+    view.setFloat32(14, 6.25, true);
+    view.setFloat32(18, 8.1, true);
+    view.setFloat32(22, 8.4, true);
+    expect(parseRoutePlanV2(finish(bytes))).toEqual({
+      style: 2,
+      epoch: 7,
+      routeCount: 1200,
+      passCount: 7,
+      leftRadiusFt: 7.5,
+      rightRadiusFt: 6.25,
+      beforeStartFt: expect.closeTo(8.1),
+      beyondEndFt: expect.closeTo(8.4),
     });
   });
 });

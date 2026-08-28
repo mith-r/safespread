@@ -45,10 +45,14 @@ inline bool routeIndexAdvanceIsPossible(uint16_t previous, uint16_t current) {
          static_cast<uint32_t>(current - previous) <= ROUTE_PROGRESS_SEARCH_WINDOW;
 }
 
-// Turn directly at the rectangle edge. Segment-bounded lookahead prevents an
-// early turn, and geometric turn tracking lands aligned on the next lane, so
-// the old 3.5 ft runout only made the rover drive needlessly far away.
-const float HEADLAND_MARGIN_FT = 0.0f;
+// Known physical footprint measured from the rear-axle point carried by every
+// route point.  The spray bar is the furthest known rearward part of the rover.
+// Turns begin only after this entire box is outside the rectangle.
+constexpr RoverFootprint ROVER_FOOTPRINT = {
+  2.5f / 12.0f,   // spray bar behind rear axle
+  13.5f / 12.0f,  // front axle ahead of rear axle
+  (19.5f / 30.48f) * 0.5f,
+};
 
 // Use the rover's measured minimum radii. Turn speed is already reduced, and
 // inflating these by 30% was the main source of unnecessarily wide headlands.
@@ -230,6 +234,71 @@ inline int segmentEndIndex(const RoutePoint *route, int count, int fromIndex) {
   return i;
 }
 
+/** First point of the run the rover is currently driving, i.e. the previous
+ *  cusp or the start of the plan. */
+inline int segmentStartIndex(const RoutePoint *route, int count, int fromIndex) {
+  (void)count;
+  bool rev = route[fromIndex].reverse;
+  int i = fromIndex;
+  while (i > 0 && route[i - 1].reverse == rev) i--;
+  return i;
+}
+
+// Points this far apart are used to measure how hard the plan is bending.
+// Route points are half a foot apart, so four of them span two feet -- long
+// enough that the half-foot quantisation of the plan does not dominate, short
+// enough to still resolve the tightest arc the rover can drive.
+const int PLAN_CURVATURE_SPAN = 4;
+
+/** Signed curvature of the planned path at `idx`, in 1/ft, positive where the
+ *  plan bends toward increasing heading (the rover's right).
+ *
+ *  This is what the steering should be doing before any tracking error is
+ *  considered. Steering an arc purely on the error between where the rover
+ *  points and where the plan points makes the command a relay: the rover has to
+ *  fall off the arc before anything asks it to turn, and by then the only
+ *  answer large enough is full lock. Knowing the arc up front means the error
+ *  term only has to correct, not to drive the whole maneuver. */
+inline float plannedCurvature(const RoutePoint *route, int count, int idx) {
+  if (route == nullptr || idx < 0 || idx >= count) return 0.0f;
+  const int start = segmentStartIndex(route, count, idx);
+  const int end = segmentEndIndex(route, count, idx);
+
+  // Prefer to look forward, along the part of the arc not yet driven. Near the
+  // cusp there is nothing left to look at, so measure the arc just completed
+  // instead; a Dubins arc has constant curvature, so the two agree.
+  //
+  // A short leg cannot support the full span. Shortening it costs precision --
+  // half-foot route quantisation is a bigger share of a shorter chord -- but
+  // reporting no curvature at all would hand the whole maneuver back to the
+  // error term, which is the behaviour this exists to replace.
+  int a = 0, b = 0, c = 0;
+  bool measurable = false;
+  for (int span = PLAN_CURVATURE_SPAN; span >= 1 && !measurable; span /= 2) {
+    a = idx; b = idx + span; c = idx + 2 * span;
+    if (c > end) { c = end; b = c - span; a = c - 2 * span; }
+    if (a < start) { a = start; b = a + span; c = a + 2 * span; }
+    measurable = a >= start && c <= end;
+  }
+  if (!measurable) return 0.0f;
+
+  const float abx = route[b].x - route[a].x, aby = route[b].y - route[a].y;
+  const float bcx = route[c].x - route[b].x, bcy = route[c].y - route[b].y;
+  const float acx = route[c].x - route[a].x, acy = route[c].y - route[a].y;
+  const float lab = sqrtf(abx * abx + aby * aby);
+  const float lbc = sqrtf(bcx * bcx + bcy * bcy);
+  const float lac = sqrtf(acx * acx + acy * acy);
+  if (lab < 1e-4f || lbc < 1e-4f || lac < 1e-4f) return 0.0f;
+
+  // Menger curvature: exact for the circle through the three points. The cross
+  // product is positive turning anticlockwise, and heading in this frame grows
+  // clockwise (0 = +Y, 90 = +X), so the sign is inverted to make positive mean
+  // "toward increasing heading" like every other curvature in the firmware.
+  const float cross = abx * bcy - aby * bcx;
+  const float kappa = -2.0f * cross / (lab * lbc * lac);
+  return std::isfinite(kappa) ? kappa : 0.0f;
+}
+
 /** Direction of the straight run the rover is currently on, as a rover
  *  heading. Taken across several points so a single point's rounding does not
  *  swing the answer. */
@@ -320,7 +389,7 @@ inline int buildForwardOnlyRoute(float fieldPassFt, float fieldWidthFt,
     const float heading = goesUp ? 0.0f : 180.0f;
 
     if (haveExit) {
-      const float approachY = startY - direction * HEADLAND_MARGIN_FT;
+      const float approachY = startY;
       DubinsPath transit = {};
       if (!dubinsCompute(exitX, exitY, routeHeadingToMath(exitHeading),
                          laneX, approachY, routeHeadingToMath(heading),
@@ -359,7 +428,7 @@ inline int buildForwardOnlyRoute(float fieldPassFt, float fieldWidthFt,
     completedLanes++;
 
     if (visit + 1 < orderCount) {
-      const float runoutY = endY + direction * HEADLAND_MARGIN_FT;
+      const float runoutY = endY;
       count += emitLineTo(out + count, maxOut - count,
                           laneX, endY, laneX, runoutY, false, false);
       if (count <= 0 || fabsf(out[count - 1].x - laneX) > 1e-4f ||
@@ -407,15 +476,6 @@ inline int buildRoute(float fieldPassFt, float fieldWidthFt,
     float dir    = goesUp ? 1.0f : -1.0f;
     float headingDeg = goesUp ? 0.0f : 180.0f;
 
-    // Run in from the headland so the rover is straight and on the line
-    // before any spray comes out. The first pass has no run-in: the rover is
-    // already sitting at its start, which is how it gets aimed.
-    if (i > 0) {
-      n += emitLineTo(out + n, maxOut - n,
-                      laneX, startY - dir * HEADLAND_MARGIN_FT,
-                      laneX, startY, false, false);
-    }
-
     n += emitLineTo(out + n, maxOut - n, laneX, startY, laneX, endY, true, false);
     if (n == 0 || fabsf(out[n - 1].x - laneX) > 1e-4f ||
         fabsf(out[n - 1].y - endY) > 1e-4f || !out[n - 1].spray) {
@@ -425,18 +485,25 @@ inline int buildRoute(float fieldPassFt, float fieldWidthFt,
 
     if (i + 1 >= lanes) break;
 
-    float headlandY = endY + dir * HEADLAND_MARGIN_FT;
-    n += emitLineTo(out + n, maxOut - n, laneX, endY, laneX, headlandY, false, false);
-
     // The turn is a pure sideways shift measured in the rover's own frame,
     // so it flips sign on return passes: the next lane is to the rover's
     // right going up the field and to its left coming back down.
     float nextX = laneCenterX(i + 1, barWidthFt, overlapFraction);
     float shift = (nextX - laneX) * cosf(turnRad(headingDeg));
 
-    TurnPlan p;
-    if (!planHeadlandTurn(shift, planLeft, planRight, p)) return n;
-    n += emitTurn(out + n, maxOut - n, p, laneX, headlandY, headingDeg);
+    OutsideTurnPlan outside;
+    if (!planOutsideHeadlandTurn(shift, planLeft, planRight,
+                                 ROVER_FOOTPRINT, outside)) return n;
+    const float headlandY = endY + dir * outside.runoutFt;
+    n += emitLineTo(out + n, maxOut - n,
+                    laneX, endY, laneX, headlandY, false, false);
+    n += emitTurn(out + n, maxOut - n, outside.turn,
+                  laneX, headlandY, headingDeg);
+    // Finish the maneuver fully outside, then drive straight back to the
+    // boundary.  The next loop iteration begins spraying from that exact
+    // aligned point.
+    n += emitLineTo(out + n, maxOut - n,
+                    nextX, headlandY, nextX, endY, false, false);
   }
 
   if (n > 0 && completedLanes == lanes) out[n - 1].terminal = true;

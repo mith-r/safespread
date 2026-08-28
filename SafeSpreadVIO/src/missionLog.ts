@@ -136,8 +136,57 @@ function logsDirectory(): Directory {
   return new Directory(Paths.document, 'SafeSpread', 'logs');
 }
 
+// A mission writes a pose and a control record for every frame the phone
+// produces. Handing each one to the filesystem separately is a synchronous
+// native call per record on the same thread that has to keep feeding the rover.
+// Batching them costs a bounded amount of unwritten tail and removes an order
+// of magnitude of those calls.
+//
+// The flush is driven from `append` rather than a timer so that it stays inside
+// the logger's serialised chain: a write that fails still fails the record that
+// triggered it, instead of throwing somewhere nobody is listening.
+export const FLUSH_INTERVAL_MS = 100;
+export const FLUSH_BYTES = 16 * 1024;
+
+/** Coalesce a sink's writes into batches. Records keep their order and their
+ *  content; only the number of trips to the underlying sink changes. */
+export function batchedLogSink(
+  inner: LogSink,
+  nowMs: () => number = Date.now,
+  intervalMs = FLUSH_INTERVAL_MS,
+  bytes = FLUSH_BYTES,
+): LogSink {
+  let pending: string[] = [];
+  let pendingBytes = 0;
+  let lastFlushMs = nowMs();
+
+  async function flush() {
+    if (pending.length === 0) return;
+    const batch = pending.join('');
+    pending = [];
+    pendingBytes = 0;
+    lastFlushMs = nowMs();
+    await inner.append(batch);
+  }
+
+  return {
+    async append(line: string) {
+      pending.push(line);
+      pendingBytes += line.length;
+      if (pendingBytes >= bytes || nowMs() - lastFlushMs >= intervalMs) await flush();
+    },
+    async close() {
+      // Whatever is still buffered belongs in the file, including the fault
+      // record that is usually the reason close is being called at all.
+      await flush();
+      await inner.close();
+    },
+  };
+}
+
 export async function createFileLogSink(
   missionId: string,
+  nowMs: () => number = Date.now,
 ): Promise<{ sink: LogSink; uri: string }> {
   const safeId = missionId.replace(/[^A-Za-z0-9._-]/g, '_');
   if (!safeId || safeId === '.' || safeId === '..') throw new Error('mission ID is invalid');
@@ -148,21 +197,19 @@ export async function createFileLogSink(
   const handle = file.open(FileMode.Append);
   const encoder = new TextEncoder();
   let closed = false;
-  return {
-    uri: file.uri,
-    sink: {
-      async append(line: string) {
-        if (closed) throw new Error('file log sink is closed');
-        handle.writeBytes(encoder.encode(line));
-      },
-      async close() {
-        if (!closed) {
-          closed = true;
-          handle.close();
-        }
-      },
+  const fileSink: LogSink = {
+    async append(text: string) {
+      if (closed) throw new Error('file log sink is closed');
+      handle.writeBytes(encoder.encode(text));
+    },
+    async close() {
+      if (!closed) {
+        closed = true;
+        handle.close();
+      }
     },
   };
+  return { uri: file.uri, sink: batchedLogSink(fileSink, nowMs) };
 }
 
 const expoDirectoryAdapter: MissionDirectoryAdapter = {

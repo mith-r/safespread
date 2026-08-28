@@ -27,19 +27,19 @@ static void configure(MissionProtocol &protocol, uint32_t now = 1000, bool pwmRe
 }
 
 int main() {
-  MissionProtocol calibrationGate;
-  calibrationGate.setPwmReady(true);
-  assert(calibrationGate.acceptCalibration(calibration(), 900).faultCode == F_NONE);
-  assert(calibrationGate.acceptPose(pose(1, 10), 900));
-  assert(calibrationGate.acceptCommand({5, 7, 2}, 900).faultCode == F_CALIBRATION);
+  MissionProtocol radiusGate;
+  radiusGate.setPwmReady(true);
+  assert(radiusGate.acceptCalibration(calibration(), 900).faultCode == F_NONE);
+  assert(radiusGate.acceptPose(pose(1, 10), 900));
+  assert(radiusGate.acceptCommand({5, 7, 2}, 900).faultCode == F_CALIBRATION);
 
-  MissionProtocol dryCalibration;
-  dryCalibration.setPwmReady(true);
-  assert(dryCalibration.acceptCalibration(calibration(), 900).faultCode == F_NONE);
-  assert(dryCalibration.acceptPose(pose(1, 10), 900));
-  AckV2 calibrationAck = dryCalibration.acceptCommand({5, 7, 2}, 900, true);
-  assert(calibrationAck.state == S_IDLE && calibrationAck.faultCode == F_NONE);
-  assert(dryCalibration.acceptCommand({6, 7, 3}, 1200, true).faultCode == F_POSE_TIMEOUT);
+  MissionProtocol dryRadius;
+  dryRadius.setPwmReady(true);
+  assert(dryRadius.acceptCalibration(calibration(), 900).faultCode == F_NONE);
+  assert(dryRadius.acceptPose(pose(1, 10), 900));
+  AckV2 radiusAck = dryRadius.acceptCommand({5, 7, 2}, 900, true);
+  assert(radiusAck.state == S_IDLE && radiusAck.faultCode == F_NONE);
+  assert(dryRadius.acceptCommand({6, 7, 3}, 1200, true).faultCode == F_ROUTE);
 
   MissionProtocol hardwareGate;
   configure(hardwareGate, 1000, false);

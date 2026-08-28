@@ -7,10 +7,8 @@
 // That single maneuver is the only transit a back-and-forth coverage route
 // needs, and solving exactly that problem beats a general pose-to-pose planner
 // here: the answer is closed form, and it can carry the rover's two turning
-// radii separately. The current wet response measures 5.54 ft to the left and
-// 5.05 ft to the right, so planning on one averaged radius
-// would ask for left turns tighter than the rover can drive and right turns
-// wider than it needs.
+// radii separately. Planning on one averaged radius would ask one direction
+// to turn tighter than the rover can drive and waste space in the other.
 //
 // Two families cover every shift, and they meet exactly at the boundary:
 //
@@ -49,6 +47,30 @@ struct TurnPlan {
   float   lengthFt;
   int     reversals;   // how many times the rover changes direction of travel
 };
+
+// Physical envelope measured from the rear-axle midpoint, which is the point
+// carried by the route.  A turn is allowed to begin only after this complete
+// footprint is outside the work rectangle.
+struct RoverFootprint {
+  float rearFt;
+  float frontFt;
+  float halfWidthFt;
+};
+
+struct TurnEnvelope {
+  float minForwardFt;
+  float maxForwardFt;
+};
+
+struct OutsideTurnPlan {
+  bool ok;
+  TurnPlan turn;
+  float runoutFt;
+  float headlandFt;
+};
+
+constexpr float TURN_ENVELOPE_SAMPLE_FT = 0.02f;
+constexpr float TURN_ENVELOPE_ALLOWANCE_FT = 0.01f;
 
 inline float turnLegLength(const TurnLeg &l) {
   return l.isArc ? l.radius * fabsf(turnRad(l.h2 - l.h1)) : l.lengthFt;
@@ -131,6 +153,83 @@ inline bool solveForwardUTurn(float shiftFt, float rLeft, float rRight,
 inline void turnPoseAt(const TurnPlan &p, float s,
                        float &x, float &y, float &headingDeg, bool &reverse);
 
+/** Continuous physical envelope of a turn in its local forward direction. */
+inline TurnEnvelope turnFootprintEnvelope(const TurnPlan &p,
+                                          const RoverFootprint &footprint) {
+  TurnEnvelope envelope = {1e9f, -1e9f};
+  for (float distance = 0.0f; distance < p.lengthFt;
+       distance += TURN_ENVELOPE_SAMPLE_FT) {
+    float x, y, headingDeg; bool reverse;
+    turnPoseAt(p, distance, x, y, headingDeg, reverse);
+    const float heading = turnRad(headingDeg);
+    const float forwards[2] = {-footprint.rearFt, footprint.frontFt};
+    const float rights[2] = {-footprint.halfWidthFt, footprint.halfWidthFt};
+    for (float forward : forwards) {
+      for (float right : rights) {
+        const float cornerY = y - right * sinf(heading) + forward * cosf(heading);
+        if (cornerY < envelope.minForwardFt) envelope.minForwardFt = cornerY;
+        if (cornerY > envelope.maxForwardFt) envelope.maxForwardFt = cornerY;
+      }
+    }
+  }
+  float x, y, headingDeg; bool reverse;
+  turnPoseAt(p, p.lengthFt, x, y, headingDeg, reverse);
+  const float heading = turnRad(headingDeg);
+  const float forwards[2] = {-footprint.rearFt, footprint.frontFt};
+  const float rights[2] = {-footprint.halfWidthFt, footprint.halfWidthFt};
+  for (float forward : forwards) {
+    for (float right : rights) {
+      const float cornerY = y - right * sinf(heading) + forward * cosf(heading);
+      if (cornerY < envelope.minForwardFt) envelope.minForwardFt = cornerY;
+      if (cornerY > envelope.maxForwardFt) envelope.maxForwardFt = cornerY;
+    }
+  }
+  return envelope;
+}
+
+inline OutsideTurnPlan outsideCandidate(const TurnPlan &turn,
+                                        const RoverFootprint &footprint) {
+  OutsideTurnPlan result = {};
+  if (!turn.ok) return result;
+  const TurnEnvelope envelope = turnFootprintEnvelope(turn, footprint);
+  result.ok = true;
+  result.turn = turn;
+  result.runoutFt = fmaxf(0.0f, -envelope.minForwardFt) +
+                    TURN_ENVELOPE_ALLOWANCE_FT;
+  result.headlandFt = result.runoutFt + envelope.maxForwardFt +
+                      TURN_ENVELOPE_ALLOWANCE_FT;
+  return result;
+}
+
+/** Smallest exact maneuver whose complete rover footprint stays outside.
+ *  `runoutFt` is how far the axle must travel beyond the rectangle before the
+ *  steering may leave centre; `headlandFt` is the total clear pavement needed. */
+inline bool planOutsideHeadlandTurn(float shiftFt, float rLeft, float rRight,
+                                    const RoverFootprint &footprint,
+                                    OutsideTurnPlan &out) {
+  out = {};
+  TurnPlan forward = {};
+  if (solveForwardUTurn(shiftFt, rLeft, rRight, forward)) {
+    out = outsideCandidate(forward, footprint);
+    return out.ok;
+  }
+
+  TurnPlan ccw = {}, cw = {};
+  const bool okCcw = solveKTurn(shiftFt, rLeft, rRight, true, ccw);
+  const bool okCw = solveKTurn(shiftFt, rLeft, rRight, false, cw);
+  if (!okCcw && !okCw) return false;
+  if (!okCcw) out = outsideCandidate(cw, footprint);
+  else if (!okCw) out = outsideCandidate(ccw, footprint);
+  else {
+    const OutsideTurnPlan a = outsideCandidate(ccw, footprint);
+    const OutsideTurnPlan b = outsideCandidate(cw, footprint);
+    out = (a.headlandFt < b.headlandFt - 1e-4f ||
+           (fabsf(a.headlandFt - b.headlandFt) <= 1e-4f &&
+            a.turn.lengthFt <= b.turn.lengthFt)) ? a : b;
+  }
+  return out.ok;
+}
+
 /** Furthest distance the maneuver reaches straight ahead of the pass end.
  *  Turn planning runs only once, so dense sampling is cheap and lets an
  *  asymmetric rover choose the physically smallest of its two K-turns. */
@@ -146,12 +245,9 @@ inline float turnForwardExtent(const TurnPlan &p) {
   return y > extent ? y : extent;
 }
 
-/** Best maneuver for the required sideways shift. A shift big enough to drive
- *  forward round is driven forward round. When both adjacent-lane K-turns are
- *  geometrically possible, lead on right lock. Wet-run telemetry shows this
- *  rover's forward-right arc follows its model while forward-left runs much
- *  wider; the tiny theoretical extent advantage of the left-led plan cost
- *  most of the next sprayed pass while it recovered. */
+/** Legacy maneuver selector retained for the forward-only comparison tests.
+ *  Production routes use planOutsideHeadlandTurn so the complete footprint,
+ *  not a preferred steering side, decides which exact maneuver is smallest. */
 inline bool planHeadlandTurn(float shiftFt, float rLeft, float rRight,
                              TurnPlan &p) {
   if (solveForwardUTurn(shiftFt, rLeft, rRight, p)) return true;

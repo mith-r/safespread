@@ -10,8 +10,9 @@
  * different plan, which is what made the earlier reactive version oscillate
  * between maneuvers.
  *
- * Controls (from the app):
- *   '1' -> Start    '2' -> Stop    '3' -> Self test    '4' -> Wet/Dry
+ * Mission control is protocol v2. Legacy one-byte Start is deliberately
+ * refused; the app owns Configure, Arm, Start, Stop, radius measurement, and
+ * the retained self-test.
  */
 
 #include <Wire.h>
@@ -22,7 +23,6 @@
 #include <BLE2902.h>
 #include <Preferences.h>
 #include <math.h>
-#include "calibration.h"
 #include "direction.h"
 #include "fault_buffer.h"
 #include "headland.h"
@@ -30,6 +30,7 @@
 #include "nav_math.h"
 #include "protocol_v2.h"
 #include "pwm_health.h"
+#include "radius_calibration.h"
 #include "route.h"
 #include "safety.h"
 #include "speed_control.h"
@@ -69,12 +70,9 @@ const float LANE_OVERLAP_FRACTION = 0.0f;
 float fieldPassFt  = 21.91f;
 float fieldWidthFt = 21.91f;
 
-// Full-lock radii observed from the 2026-08-28 wet mission telemetry. The
-// servo was already commanded to both configured stops throughout the turns,
-// but the vehicle produced substantially wider circles than the old dry
-// 4.33/2.92 ft measurements. Planning with those stale radii made the route
-// change legs before the nose had rotated far enough, then forced a huge loop
-// inside the rectangle to recover.
+// Safe fallback until the one-button measurement has run. The measurement
+// changes only these curvature values; it deliberately keeps the existing
+// left/centre/right PWM signals unchanged.
 float turnRadiusLeftFt  = 5.54f;
 float turnRadiusRightFt = 5.05f;
 
@@ -87,7 +85,7 @@ float turnRadiusRightFt = 5.05f;
 // Explicit measured curvature map. Straight is a direct calibration knot,
 // not a midpoint inferred from the two steering endpoints. Runtime control
 // interpolates this table without silently relearning its center.
-SteeringKnot steeringMap[MAX_CALIBRATION_KNOTS] = {
+SteeringKnot steeringMap[3] = {
   {STEER_LEFT_US, -1.0f / 5.54f},
   {1709, 0.0f},
   {STEER_RIGHT_US, 1.0f / 5.05f},
@@ -99,6 +97,15 @@ int  lastSteerCommandUs = 1500;
 float steerCentreUs() {
   const float pulse = pulseForCurvature(steeringMap, steeringMapCount, 0.0f);
   return isfinite(pulse) ? pulse : static_cast<float>(STEER_CENTER_US);
+}
+
+/** Tightest curvature the map claims is available turning the given way, as a
+ *  positive magnitude. Zero when the map has not been validated. */
+float maxCurvaturePerFt(bool rightward) {
+  if (!steeringMapValid || steeringMapCount < 2) return 0.0f;
+  const float edge = rightward ? steeringMap[steeringMapCount - 1].curvaturePerFt
+                               : steeringMap[0].curvaturePerFt;
+  return fabsf(edge);
 }
 
 // Steering polarity: +1 means a pulse BELOW centre steers toward increasing
@@ -187,39 +194,31 @@ bool hasBootFaultSummary = false;
 
 constexpr uint32_t HARDWARE_TAG_HASH = 0x89abcdef;
 
-class PreferencesCalibrationStore {
+class PreferencesTurnRadiusStore {
  public:
   bool read(uint8_t *out, size_t size) {
     Preferences prefs;
-    if (!prefs.begin("ss-motion", true)) return false;
-    const bool ok = prefs.getBytesLength("compact") == size &&
-                    prefs.getBytes("compact", out, size) == size;
+    if (!prefs.begin("ss-radius", true)) return false;
+    const bool ok = prefs.getBytesLength("measured") == size &&
+                    prefs.getBytes("measured", out, size) == size;
     prefs.end();
     return ok;
   }
   bool write(const uint8_t *data, size_t size) {
     Preferences prefs;
-    if (!prefs.begin("ss-motion", false)) return false;
-    const bool ok = prefs.putBytes("compact", data, size) == size;
+    if (!prefs.begin("ss-radius", false)) return false;
+    const bool ok = prefs.putBytes("measured", data, size) == size;
     prefs.end();
     return ok;
   }
 };
 
-PreferencesCalibrationStore calibrationStore;
-MotionCalibrationPersistence<PreferencesCalibrationStore> calibrationPersistence(calibrationStore);
-CompactMotionCalibration storedMotionCalibration = {};
-bool hasStoredMotionCalibration = false;
-SteeringCalibrationSample steeringCalibrationSamples[6] = {};
-int steeringCalibrationSampleCount = 0;
-SpeedCalibrationSample forwardSpeedSamples[3] = {};
-int forwardSpeedSampleCount = 0;
-SpeedCalibrationSample reverseSpeedSamples[3] = {};
-int reverseSpeedSampleCount = 0;
-SteeringCalibrationFit pendingSteeringFit = {};
-bool straightCalibrationValidated = false;
-bool reverseCalibrationVerified = false;
-bool calibrationActive = false;
+PreferencesTurnRadiusStore turnRadiusStore;
+TurnRadiusPersistence<PreferencesTurnRadiusStore> turnRadiusPersistence(turnRadiusStore);
+StoredTurnRadii storedTurnRadii = {};
+bool hasMeasuredTurnRadii = false;
+bool radiusMeasurementActive = false;
+RadiusSweep radiusSweep;
 
 const int MAX_ROUTE_POINTS = 6000;
 // The plan is 70 KB -- by far the largest thing this firmware owns. Held
@@ -249,6 +248,17 @@ const float RESUME_HEADING_TOLERANCE_DEG = 12.0f;
 // lookahead tracks smoothly; through a turn it must be shorter than the arc's
 // radius or the rover simply cuts the corner and misses the maneuver.
 const float LOOKAHEAD_TURN_FT = 1.0f;
+
+// Through a turn the arc itself is fed forward from the plan, so the lookahead
+// error only has to correct. Dividing that error by the raw lookahead distance
+// makes the correction alone reach full lock at six degrees, which is inside
+// the pose noise -- so the "correction" becomes the whole command and the
+// steering behaves as a relay slamming between the two locks. Measuring the
+// error against a longer distance keeps it proportional over the range that
+// actually occurs, and the cap stops one bad lookahead sample from swinging the
+// wheels lock to lock on its own.
+const float TURN_CORRECTION_DISTANCE_FT = 3.0f;
+const float TURN_CORRECTION_LIMIT_FRACTION = 0.5f;
 
 // How sharply the rover converges onto a straight pass, in feet. Smaller is
 // quicker but works the steering harder against position noise; 1.5 ft closes
@@ -503,24 +513,16 @@ void stopDrive() {
   setChannelPulse(STEER_CH, (int)steerCentreUs());
 }
 
-void applyMotionCalibration(const CompactMotionCalibration &calibration) {
-  if (!compactCalibrationValid(calibration)) return;
-  steeringMapCount = calibration.knotCount;
-  for (int index = 0; index < steeringMapCount; ++index) {
-    steeringMap[index] = calibration.knots[index];
-  }
+void applyTurnRadii(float leftFt, float rightFt) {
+  if (!validTurnRadius(leftFt) || !validTurnRadius(rightFt)) return;
+  turnRadiusLeftFt = leftFt;
+  turnRadiusRightFt = rightFt;
+  steeringMap[0].curvaturePerFt = -1.0f / leftFt;
+  steeringMap[steeringMapCount - 1].curvaturePerFt = 1.0f / rightFt;
   steeringMapValid = validSteeringMap(steeringMap, steeringMapCount);
-  if (steeringMapValid) {
-    turnRadiusLeftFt = -1.0f / steeringMap[0].curvaturePerFt;
-    turnRadiusRightFt = 1.0f / steeringMap[steeringMapCount - 1].curvaturePerFt;
-  }
-  forwardFeedForwardUs = calibration.forwardFeedForwardUs;
-  reverseFeedForwardUs = calibration.reverseFeedForwardUs;
 }
 
-bool motionCalibrationReady() {
-  // A stored calibration improves tracking, but it is not required. The
-  // compiled-in steering map and feed-forward values are the wet-mode fallback.
+bool steeringModelReady() {
   return steeringMapValid;
 }
 
@@ -618,6 +620,29 @@ void sendTelemetry() {
   }
 }
 
+void sendRoutePlan() {
+  if (routeStyle == ROUTE_NONE || routeCount <= 0 || routeRequirements.truncated) return;
+  protocol_v2::RoutePlanV2 plan = {};
+  plan.style = static_cast<uint8_t>(routeStyle);
+  plan.epoch = mission.epoch();
+  plan.routeCount = saturatedCounter(routeCount);
+  plan.passCount = saturatedCounter(routePassCount(route, routeCount));
+  plan.leftRadiusFt = turnRadiusLeftFt;
+  plan.rightRadiusFt = turnRadiusRightFt;
+  plan.beforeStartFt = routeRequirements.beforeStartFt;
+  plan.beyondEndFt = routeRequirements.beyondEndFt;
+  uint8_t packet[protocol_v2::ROUTE_PLAN_SIZE];
+  if (protocol_v2::buildRoutePlanV2(plan, packet, sizeof(packet))) {
+    bleBinary(packet, sizeof(packet));
+  }
+}
+
+void announceTurnRadii() {
+  bleLog("[RADIUS STATUS] left=" + String(turnRadiusLeftFt, 2) +
+         " right=" + String(turnRadiusRightFt, 2) + " ft source=" +
+         String(hasMeasuredTurnRadii ? "measured" : "built-in") + ".");
+}
+
 void announceArea() {
   int lanes = laneCount(fieldWidthFt, BAR_WIDTH_FT, LANE_OVERLAP_FRACTION);
   float covered = laneCenterX(lanes - 1, BAR_WIDTH_FT, LANE_OVERLAP_FRACTION) +
@@ -693,6 +718,7 @@ void serviceSafetyEvents() {
     resetCourse();
     if (shouldAck) sendAck(ack);
     bleLog(">>> Mission stopped.");
+    announceTurnRadii();
   }
 
   if (shouldSendStatus) sendTelemetry();
@@ -856,87 +882,27 @@ bool runDriveTest(uint32_t generation) {
   return forwardVerified && reverseVerified;
 }
 
-void resetMotionCalibrationSession() {
-  steeringCalibrationSampleCount = 0;
-  forwardSpeedSampleCount = 0;
-  reverseSpeedSampleCount = 0;
-  pendingSteeringFit = {};
-  straightCalibrationValidated = false;
-  reverseCalibrationVerified = false;
-  memset(steeringCalibrationSamples, 0, sizeof(steeringCalibrationSamples));
-  memset(forwardSpeedSamples, 0, sizeof(forwardSpeedSamples));
-  memset(reverseSpeedSamples, 0, sizeof(reverseSpeedSamples));
-}
-
-bool calibrationCanContinue(uint32_t generation) {
+bool radiusMeasurementCanContinue(uint32_t generation) {
   return diagnosticCanContinue(generation) && dryRunMode &&
          mission.poseFresh(millis()) && !safetyEventPending();
 }
 
-bool measureCalibrationTravel(bool reverse, int pulseUs, int steeringPulseUs,
-                              float targetDistanceFt, uint32_t generation,
-                              float &alongFt, float &elapsedSeconds,
-                              float &headingDeltaDeg) {
-  if (!calibrationCanContinue(generation)) return false;
-  setSpray(false);
-  setChannelPulse(STEER_CH, steeringPulseUs);
-  driveDirection.begin(reverse, reverse, millis(), robotX_ft, robotY_ft,
-                       robotHeading, pulseUs, NEUTRAL_US);
-  while (!driveDirection.ready() && !driveDirection.failed()) {
-    pumpBle();
-    if (!calibrationCanContinue(generation)) {
-      stopDrive();
-      return false;
-    }
-    setChannelPulse(STEER_CH, steeringPulseUs);
-    setChannelPulse(ESC_CH,
-                    driveDirection.update(millis(), robotX_ft, robotY_ft));
-    delay(10);
-  }
-  if (!driveDirection.ready()) {
-    stopDrive();
-    return false;
-  }
-
-  const float x0 = robotX_ft, y0 = robotY_ft, heading0 = robotHeading;
-  const float radians = heading0 * (float)M_PI / 180.0f;
-  const unsigned long startedAt = millis();
-  alongFt = 0.0f;
-  while (fabsf(alongFt) < targetDistanceFt && millis() - startedAt < 10000) {
-    pumpBle();
-    if (!calibrationCanContinue(generation)) {
-      stopDrive();
-      return false;
-    }
-    setChannelPulse(STEER_CH, steeringPulseUs);
-    setChannelPulse(ESC_CH,
-                    driveDirection.update(millis(), robotX_ft, robotY_ft));
-    const float dx = robotX_ft - x0, dy = robotY_ft - y0;
-    alongFt = dx * sinf(radians) + dy * cosf(radians);
-    delay(10);
-  }
-  elapsedSeconds = (millis() - startedAt) / 1000.0f;
-  headingDeltaDeg = angleDiffDeg(robotHeading, heading0);
-  const bool signMatches = reverse ? alongFt <= -targetDistanceFt : alongFt >= targetDistanceFt;
-  stopDrive();
-  return signMatches && elapsedSeconds > 0.0f;
-}
-
-bool measureCalibrationArc(int pulseUs, uint32_t generation,
-                           SteeringCalibrationSample &sample) {
-  if (!calibrationCanContinue(generation)) return false;
-  setSpray(false);
-  setChannelPulse(STEER_CH, pulseUs);
+bool measureOneTurnRadius(bool right, uint32_t generation,
+                          RadiusSweepResult &result) {
+  if (!radiusMeasurementCanContinue(generation)) return false;
+  const int steeringUs = right ? STEER_RIGHT_US : STEER_LEFT_US;
   const int throttleUs = NEUTRAL_US + static_cast<int>(forwardFeedForwardUs);
+  setSpray(false);
+  setChannelPulse(STEER_CH, steeringUs);
   driveDirection.begin(false, false, millis(), robotX_ft, robotY_ft,
                        robotHeading, throttleUs, NEUTRAL_US);
   while (!driveDirection.ready() && !driveDirection.failed()) {
     pumpBle();
-    if (!calibrationCanContinue(generation)) {
+    if (!radiusMeasurementCanContinue(generation)) {
       stopDrive();
       return false;
     }
-    setChannelPulse(STEER_CH, pulseUs);
+    setChannelPulse(STEER_CH, steeringUs);
     setChannelPulse(ESC_CH,
                     driveDirection.update(millis(), robotX_ft, robotY_ft));
     delay(10);
@@ -946,166 +912,74 @@ bool measureCalibrationArc(int pulseUs, uint32_t generation,
     return false;
   }
 
-  const float heading0 = robotHeading;
-  float previousX = robotX_ft, previousY = robotY_ft;
-  float distanceFt = 0.0f;
-  float sweptDeg = 0.0f;
+  radiusSweep.begin(lastControlSequence, robotX_ft, robotY_ft, robotHeading);
   const unsigned long startedAt = millis();
-  while (fabsf(sweptDeg) < MIN_CALIBRATION_SWEEP_DEG &&
-         millis() - startedAt < 12000) {
+  while (!radiusSweep.reachedTarget() && !radiusSweep.failed() &&
+         radiusSweep.pathFt() < 30.0f && millis() - startedAt < 45000) {
     pumpBle();
-    if (!calibrationCanContinue(generation)) {
+    if (!radiusMeasurementCanContinue(generation)) {
       stopDrive();
       return false;
     }
-    setChannelPulse(STEER_CH, pulseUs);
+    radiusSweep.add(lastControlSequence, robotX_ft, robotY_ft, robotHeading);
+    setChannelPulse(STEER_CH, steeringUs);
     setChannelPulse(ESC_CH,
                     driveDirection.update(millis(), robotX_ft, robotY_ft));
-    const float dx = robotX_ft - previousX, dy = robotY_ft - previousY;
-    const float stepFt = sqrtf(dx * dx + dy * dy);
-    if (stepFt < 1.0f) distanceFt += stepFt;
-    previousX = robotX_ft;
-    previousY = robotY_ft;
-    sweptDeg = angleDiffDeg(robotHeading, heading0);
     delay(10);
   }
   stopDrive();
-  if (fabsf(sweptDeg) < MIN_CALIBRATION_SWEEP_DEG || distanceFt < 3.0f) return false;
-  sample = {pulseUs,
-            sweptDeg * (float)M_PI / 180.0f / distanceFt,
-            fabsf(sweptDeg),
-            +1};
-  return true;
+  result = radiusSweep.finish(right);
+  return result.valid;
 }
 
-void tryCommitMotionCalibration() {
-  if (!pendingSteeringFit.valid || forwardSpeedSampleCount < 3 ||
-      reverseSpeedSampleCount < 3 || !reverseCalibrationVerified) return;
-  float forwardFit = 0.0f, reverseFit = 0.0f;
-  if (!fitSpeedFeedForward(forwardSpeedSamples, forwardSpeedSampleCount,
-                           +1, NEUTRAL_US, forwardFit) ||
-      !fitSpeedFeedForward(reverseSpeedSamples, reverseSpeedSampleCount,
-                           -1, NEUTRAL_US, reverseFit)) {
-    bleLog("[CAL FAIL] Speed samples are inconsistent.");
+void runTurnRadiusMeasurement() {
+  if (radiusMeasurementActive) {
+    bleLog("[RADIUS FAIL] A measurement is already active.");
     return;
   }
-  const CompactMotionCalibration candidate = makeCompactCalibration(
-      mission.calibration().schemaVersion, mission.calibrationId(),
-      HARDWARE_TAG_HASH, pendingSteeringFit, forwardFit, reverseFit, true);
-  if (!calibrationPersistence.save(candidate)) {
-    bleLog("[CAL FAIL] Could not persist compact motion calibration.");
-    return;
-  }
-  storedMotionCalibration = candidate;
-  hasStoredMotionCalibration = true;
-  applyMotionCalibration(storedMotionCalibration);
-  bleLog("[CAL PASS] Motion calibration saved for ID " +
-         String(storedMotionCalibration.calibrationId) + ".");
-}
-
-bool runSteeringCalibrationStep(uint32_t generation) {
-  if (!straightCalibrationValidated) {
-    float along = 0.0f, seconds = 0.0f, headingDelta = 0.0f;
-    const int pulse = NEUTRAL_US + static_cast<int>(forwardFeedForwardUs);
-    bleLog("[CAL STEER] Straight validation: keep 8 ft of pavement clear ahead.");
-    if (!measureCalibrationTravel(false, pulse, static_cast<int>(steerCentreUs()),
-                                  6.0f, generation, along, seconds, headingDelta) ||
-        fabsf(headingDelta) > 2.0f) {
-      bleLog("[CAL FAIL] Direct straight pulse bent more than 2 degrees over 6 ft.");
-      return false;
-    }
-    straightCalibrationValidated = true;
-    bleLog("[CAL PASS] Direct straight pulse verified at " +
-           String(static_cast<int>(steerCentreUs())) + "us.");
-    return true;
-  }
-
-  static const int PULSES[6] = {2300, 2300, 2300, 800, 800, 800};
-  if (steeringCalibrationSampleCount >= 6) {
-    bleLog("[CAL STEER] Steering samples already complete.");
-    return true;
-  }
-  const int pulse = PULSES[steeringCalibrationSampleCount];
-  bleLog("[CAL STEER] Arc " + String(steeringCalibrationSampleCount + 1) +
-         "/6 at " + String(pulse) + "us; keep the sweep area clear.");
-  SteeringCalibrationSample sample = {};
-  if (!measureCalibrationArc(pulse, generation, sample)) {
-    bleLog("[CAL FAIL] Arc did not produce a valid 60 degree sweep.");
-    return false;
-  }
-  steeringCalibrationSamples[steeringCalibrationSampleCount++] = sample;
-  bleLog("[CAL SAMPLE] steer=" + String(pulse) +
-         " curvature=" + String(sample.curvaturePerFt, 4) + " 1/ft.");
-  if (steeringCalibrationSampleCount == 6) {
-    if (!fitSteeringCalibration(steeringCalibrationSamples, 6,
-                                static_cast<int>(steerCentreUs()), pendingSteeringFit)) {
-      bleLog("[CAL FAIL] Steering samples do not form a monotonic two-sided map.");
-      return false;
-    }
-    bleLog("[CAL PASS] Steering map fit is complete.");
-    tryCommitMotionCalibration();
-  }
-  return true;
-}
-
-bool runSpeedCalibrationStep(uint32_t generation) {
-  static const int FORWARD_PULSES[3] = {1610, 1620, 1630};
-  static const int REVERSE_PULSES[3] = {1390, 1380, 1370};
-  const bool reverse = forwardSpeedSampleCount >= 3;
-  int &sampleCount = reverse ? reverseSpeedSampleCount : forwardSpeedSampleCount;
-  if (reverse && sampleCount >= 3) {
-    bleLog("[CAL SPEED] Speed samples already complete.");
-    return true;
-  }
-  const int pulse = reverse ? REVERSE_PULSES[sampleCount] : FORWARD_PULSES[sampleCount];
-  bleLog("[CAL SPEED] " + String(reverse ? "reverse " : "forward ") +
-         String(sampleCount + 1) + "/3; keep 5 ft clear.");
-  float along = 0.0f, seconds = 0.0f, headingDelta = 0.0f;
-  if (!measureCalibrationTravel(reverse, pulse, static_cast<int>(steerCentreUs()),
-                                3.0f, generation, along, seconds, headingDelta)) {
-    bleLog("[CAL FAIL] Speed run did not reach 3 ft in the commanded direction.");
-    return false;
-  }
-  SpeedCalibrationSample sample = {
-    pulse,
-    along / seconds,
-    fabsf(along),
-    static_cast<int8_t>(reverse ? -1 : +1),
-  };
-  if (reverse) reverseSpeedSamples[sampleCount++] = sample;
-  else forwardSpeedSamples[sampleCount++] = sample;
-  bleLog("[CAL SAMPLE] throttle=" + String(pulse) +
-         " speed=" + String(sample.speedFps, 2) + " ft/s.");
-  tryCommitMotionCalibration();
-  return true;
-}
-
-bool runReverseCalibrationStep(uint32_t generation) {
-  reverseCalibrationVerified = runDriveTest(generation);
-  if (!reverseCalibrationVerified) {
-    bleLog("[CAL FAIL] Reverse direction was not verified.");
-    return false;
-  }
-  bleLog("[CAL PASS] Reverse direction sequence verified.");
-  tryCommitMotionCalibration();
-  return true;
-}
-
-void runCalibrationCommand(uint8_t opcode) {
-  if (calibrationActive) {
-    bleLog("[CAL] A calibration step is already active.");
-    return;
-  }
-  calibrationActive = true;
+  radiusMeasurementActive = true;
   const uint32_t generation = currentSafetyAbortGeneration();
-  bool ok = false;
-  if (opcode == 5) ok = runSteeringCalibrationStep(generation);
-  else if (opcode == 6) ok = runSpeedCalibrationStep(generation);
-  else if (opcode == 7) ok = runReverseCalibrationStep(generation);
+  RadiusSweepResult left = {}, right = {};
+
+  bleLog("[RADIUS] Measuring LEFT at existing " + String(STEER_LEFT_US) +
+         "us. The rover will sweep about 90 degrees.");
+  if (!measureOneTurnRadius(false, generation, left)) {
+    bleLog("[RADIUS FAIL] Left sweep was not long, smooth, and circular enough.");
+  } else {
+    bleLog("[RADIUS SAMPLE] left=" + String(left.radiusFt, 2) +
+           " ft (arc check " + String(left.arcRadiusFt, 2) + " ft, " +
+           String(fabsf(left.sweepDeg), 0) + " deg).");
+  }
+
+  if (left.valid && diagnosticWait(1000, generation)) {
+    bleLog("[RADIUS] Measuring RIGHT at existing " + String(STEER_RIGHT_US) +
+           "us. The rover will sweep back about 90 degrees.");
+    if (!measureOneTurnRadius(true, generation, right)) {
+      bleLog("[RADIUS FAIL] Right sweep was not long, smooth, and circular enough.");
+    } else {
+      bleLog("[RADIUS SAMPLE] right=" + String(right.radiusFt, 2) +
+             " ft (arc check " + String(right.arcRadiusFt, 2) + " ft, " +
+             String(fabsf(right.sweepDeg), 0) + " deg).");
+    }
+  }
+
+  if (left.valid && right.valid) {
+    const StoredTurnRadii candidate = makeStoredTurnRadii(
+        HARDWARE_TAG_HASH, left.radiusFt, right.radiusFt);
+    if (!turnRadiusPersistence.save(candidate, HARDWARE_TAG_HASH)) {
+      bleLog("[RADIUS FAIL] The measurements could not be saved.");
+    } else {
+      storedTurnRadii = candidate;
+      hasMeasuredTurnRadii = true;
+      applyTurnRadii(candidate.leftFt, candidate.rightFt);
+      bleLog("[RADIUS PASS] left=" + String(turnRadiusLeftFt, 2) +
+             " right=" + String(turnRadiusRightFt, 2) + " ft saved.");
+    }
+  }
+
   setSpray(false);
   stopDrive();
-  calibrationActive = false;
-  if (!ok) bleLog("[CAL] Step failed; correct the cause and explicitly retry.");
+  radiusMeasurementActive = false;
 }
 
 // Port of diagnostics.ino, callable at runtime so wiring can be checked
@@ -1181,10 +1055,9 @@ void runSelfTest() {
     setSpray(false); stopDrive(); selfTestActive = false; return;
   }
 
-  // Centre is where the wheels really point straight, computed from the two
-  // measured circles -- not the middle of the servo's travel. Look along the
-  // rover here: the front wheels should be dead straight. If they are not,
-  // re-measure the turning radii, because everything else is built on them.
+  // Straight-ahead is the fixed steering-map knot, not the middle of the
+  // servo's travel and not inferred from the radius measurement. Look along
+  // the rover here: the front wheels should be dead straight.
   bleLog("[INFO] Steering CENTER (" + String((int)steerCentreUs()) +
          "us, servo mid is " + String(STEER_CENTER_US) + ")...");
   setChannelPulse(STEER_CH, (int)steerCentreUs());
@@ -1249,18 +1122,13 @@ void planRoute() {
     return;
   }
   const protocol_v2::RectangleV2 &rectangle = mission.rectangle();
-  const bool preferForwardOnly = (rectangle.flags & 0x04) != 0;
-  const RouteSelection selection = selectRoute(
+  routeCount = buildRoute(
       fieldPassFt, fieldWidthFt, BAR_WIDTH_FT, LANE_OVERLAP_FRACTION,
-      turnRadiusLeftFt, turnRadiusRightFt,
-      rectangle.startClearFt, rectangle.endClearFt,
-      preferForwardOnly, route, MAX_ROUTE_POINTS);
-  routeCount = selection.count;
-  routeStyle = selection.style;
-  routeRequirements = selection.requirements;
-  routePlanningFault = routeStyle == ROUTE_NONE
-      ? (routeRequirements.truncated ? F_ROUTE : F_HEADLAND)
-      : F_NONE;
+      turnRadiusLeftFt, turnRadiusRightFt, route, MAX_ROUTE_POINTS);
+  routeRequirements = inspectRoute(route, routeCount, fieldPassFt);
+  routeStyle = routeCount > 0 && !routeRequirements.truncated
+      ? ROUTE_THREE_POINT : ROUTE_NONE;
+  routePlanningFault = routeStyle == ROUTE_NONE ? F_ROUTE : F_NONE;
 
   // A resume asks to skip the passes already laid down. Refuse a pass the plan
   // does not contain rather than silently starting from the beginning, which
@@ -1316,9 +1184,9 @@ void planRoute() {
   bleLog("Turn radii L=" + String(turnRadiusLeftFt, 2) + " R=" +
          String(turnRadiusRightFt, 2) + " ft, straight-ahead at " +
          String((int)steerCentreUs()) + "us.");
-  bleLog("Needs clear pavement " + String(routeRequirements.beyondEndFt, 1) +
-         " ft past the far end, " + String(routeRequirements.beforeStartFt, 1) +
-         " ft behind the start.");
+  bleLog("[ROUTE] headland before=" + String(routeRequirements.beforeStartFt, 2) +
+         " beyond=" + String(routeRequirements.beyondEndFt, 2) +
+         " ft; complete rover footprint stays outside while turning.");
 
   // The app cannot compute where a resumed pass begins -- forward-only plans
   // visit lanes out of order -- so the rover states it, and the app holds the
@@ -1331,13 +1199,10 @@ void planRoute() {
            " hdg=" + String(segmentHeadingDeg(route, routeCount, routeStartIndex), 1));
   }
 
-  if (routeStyle == ROUTE_NONE && routePlanningFault == F_HEADLAND) {
-    bleLog("!! Neither forward-only nor three-point turns fit the entered clear pavement.");
-  }
-
   if (routeRequirements.truncated) {
     bleLog("!! Route hit the point limit; area is too large to plan fully.");
   }
+  sendRoutePlan();
 }
 
 // Whether the rover is standing where the plan starts. Only meaningful for a
@@ -1452,6 +1317,15 @@ void runFollow() {
   if (!directionRequested || reversing != escReverse) {
     escReverse = reversing;
     directionRequested = true;
+    // Course over ground describes the leg just finished, not the one about to
+    // start, and it is only sampled driving forward -- so after a reverse leg
+    // it still points the way the rover was going before the three-point turn,
+    // up to a hundred degrees away from where the nose is now. Steering on that
+    // for the first foot of every new leg is what sent the rover out of the
+    // headland on full lock in the wrong direction. Dropping it falls back to
+    // the reported heading, which is correct the moment the rover is standing
+    // still, and course over ground re-earns itself over the next foot.
+    resetCourse();
     speedController.reset();
     speedController.feedForwardUs = reversing
         ? reverseFeedForwardUs : forwardFeedForwardUs;
@@ -1490,8 +1364,11 @@ void runFollow() {
   float err, command, requestedCurvature;
 
   if (route[routeIndex].turning) {
-    // Through a turn there is no line to hold, only a curve to follow, so aim
-    // at a point a short way along it.
+    // Through a turn there is no line to hold, only a curve to follow. Drive
+    // the arc the plan already contains and use the lookahead point only to
+    // correct for having drifted off it. Steering the whole maneuver from that
+    // error instead means nothing asks the rover to turn until it has already
+    // failed to, and the answer is then always full lock.
     int la = lookaheadWithinSegment(route, routeCount, routeIndex,
                                     robotX_ft, robotY_ft, LOOKAHEAD_TURN_FT);
     float want = bearingToWaypointDeg(route[la].x - robotX_ft,
@@ -1500,7 +1377,17 @@ void runFollow() {
     const float targetDistance = sqrtf(
         (route[la].x - robotX_ft) * (route[la].x - robotX_ft) +
         (route[la].y - robotY_ft) * (route[la].y - robotY_ft));
-    requestedCurvature = purePursuitCurvature(err, targetDistance);
+
+    const float plannedKappa = plannedCurvature(route, routeCount, routeIndex);
+    float correction = purePursuitCurvature(err, targetDistance,
+                                            TURN_CORRECTION_DISTANCE_FT);
+    const float correctionLimit = TURN_CORRECTION_LIMIT_FRACTION *
+        maxCurvaturePerFt(correction >= 0.0f);
+    if (correctionLimit > 0.0f) {
+      if (correction > correctionLimit) correction = correctionLimit;
+      if (correction < -correctionLimit) correction = -correctionLimit;
+    }
+    requestedCurvature = plannedKappa + correction;
     command = curvatureToCommand(requestedCurvature,
                                  turnRadiusLeftFt, turnRadiusRightFt,
                                  MAX_STEER_OFFSET);
@@ -1534,7 +1421,8 @@ void runFollow() {
   // Steering acts on the direction of travel the opposite way in reverse:
   // right lock swings the nose left, so the same command turns the rover's
   // path the other way.
-  steerCurvature(reversing ? -requestedCurvature : requestedCurvature);
+  const float steerKappa = reversing ? -requestedCurvature : requestedCurvature;
+  steerCurvature(steerKappa);
 
   if (!reversing) {
     observeSteeringPolarity();
@@ -1651,7 +1539,6 @@ void feed(const uint8_t *d, size_t n, uint32_t receivedAtMs) {
         invalidPacketCount = 0;
         for (uint8_t code = 0; code <= F_HEADLAND; ++code) poseRejectCounts[code] = 0;
         lastPoseRejectLogMs = 0;
-        resetMotionCalibrationSession();
       }
       sendAck(ack);
       return;
@@ -1676,6 +1563,8 @@ void feed(const uint8_t *d, size_t n, uint32_t receivedAtMs) {
           enterFault(routePlanningFault);
           ack = mission.overrideLastSetupWithFault(routePlanningFault);
         }
+      } else if (ack.faultCode == F_NONE && mission.lastSetupWasDuplicate()) {
+        sendRoutePlan();
       }
       sendAck(ack);
       return;
@@ -1688,24 +1577,24 @@ void feed(const uint8_t *d, size_t n, uint32_t receivedAtMs) {
         return;
       }
 
-      const bool calibrationOpcode = command.opcode >= 5 && command.opcode <= 7;
-      if (calibrationOpcode && mission.state() == S_IDLE) {
-        dryRunMode = true;  // calibration commands are explicit dry-motion confirmations
+      const bool radiusOpcode = command.opcode == 5;
+      if (radiusOpcode && mission.state() == S_IDLE) {
+        dryRunMode = true;  // radius measurement is explicit dry motion
         setSpray(false);
       }
-      if (command.opcode == 1 || command.opcode == 2 || calibrationOpcode) {
+      if (command.opcode == 1 || command.opcode == 2 || radiusOpcode) {
         const bool ready = ensurePwmReady();
         mission.setPwmReady(ready);
       }
       if (command.opcode == 1) mission.setStartPointReached(atRouteStart());
 
       protocol_v2::AckV2 ack = mission.acceptCommand(
-          command, receivedAtMs, calibrationOpcode && dryRunMode);
+          command, receivedAtMs, radiusOpcode && dryRunMode);
       const bool duplicate = mission.lastCommandWasDuplicate();
 
-      if (calibrationOpcode) {
-        sendAck(ack);  // acknowledge the operator-confirmed step before it moves
-        if (ack.faultCode == F_NONE && !duplicate) runCalibrationCommand(command.opcode);
+      if (radiusOpcode) {
+        sendAck(ack);  // acknowledge the operator-confirmed measurement before it moves
+        if (ack.faultCode == F_NONE && !duplicate) runTurnRadiusMeasurement();
         return;
       }
 
@@ -1716,6 +1605,7 @@ void feed(const uint8_t *d, size_t n, uint32_t receivedAtMs) {
         routeIndex = 0;
         resetCourse();
         bleLog(">>> Mission stopped.");
+        announceTurnRadii();
       } else if (ack.faultCode == F_NONE && command.opcode == 2 && !duplicate) {
         if (routeCount < 2) {
           enterFault(F_ROUTE);
@@ -1854,11 +1744,7 @@ class ServerCallbacks : public BLEServerCallbacks {
     // Re-announce state so a freshly connected app isn't showing stale UI,
     // and because these were generated at boot with nobody listening.
     announceArea();
-    bleLog("Turn radii L=" + String(turnRadiusLeftFt, 2) + " R=" +
-           String(turnRadiusRightFt, 2) + " ft.");
-    bleLog(hasStoredMotionCalibration
-        ? "[CAL] Stored motion calibration loaded."
-        : "[CAL] Using built-in motion settings; wet operation is available.");
+    announceTurnRadii();
     bleLog(dryRunMode ? "[MODE] DRY" : "[MODE] WET");
     bleLog(sprayActive ? "[SPRAY] ON" : "[SPRAY] OFF");
     if (hasBootFaultSummary) {
@@ -1891,8 +1777,11 @@ void setup() {
   }
 
   steeringMapValid = validSteeringMap(steeringMap, steeringMapCount);
-  hasStoredMotionCalibration = calibrationPersistence.load(storedMotionCalibration);
-  if (hasStoredMotionCalibration) applyMotionCalibration(storedMotionCalibration);
+  hasMeasuredTurnRadii = turnRadiusPersistence.load(storedTurnRadii,
+                                                     HARDWARE_TAG_HASH);
+  if (hasMeasuredTurnRadii) {
+    applyTurnRadii(storedTurnRadii.leftFt, storedTurnRadii.rightFt);
+  }
 
   pinMode(VALVE_PIN, OUTPUT);
   pinMode(PUMP_PIN, OUTPUT);
@@ -1963,7 +1852,7 @@ void loop() {
       driveDirection.wrongDirection,
       true,
       routeCount >= 2 && routeStyle != ROUTE_NONE && !routeRequirements.truncated,
-      motionCalibrationReady(),
+      steeringModelReady(),
       routeStyle != ROUTE_NONE,
     };
     FaultCode fault = evaluateSafety(mission.state(), safety);

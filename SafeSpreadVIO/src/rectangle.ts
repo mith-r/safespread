@@ -8,8 +8,6 @@ export interface RectangleDefinition {
   mFt: number;
   nFt: number;
   side: CoverageSide;
-  startClearFt: number;
-  endClearFt: number;
   source: 'entered' | 'walked';
 }
 
@@ -27,11 +25,6 @@ function requirePose(pose: Pose, name: string): Pose {
 
 function requirePositive(value: number, name: string): number {
   if (!Number.isFinite(value) || value <= 0) throw new RangeError(`${name} must be positive`);
-  return value;
-}
-
-function requireClearance(value: number, name: string): number {
-  if (!Number.isFinite(value) || value < 0) throw new RangeError(`${name} must not be negative`);
   return value;
 }
 
@@ -56,8 +49,6 @@ export function defineEnteredRectangle(
   mFt: number,
   nFt: number,
   side: CoverageSide,
-  startClearFt: number,
-  endClearFt: number,
 ): RectangleDefinition {
   const originWorld = requirePose(stableRover, 'rover');
   if (side !== 'right' && side !== 'left') throw new RangeError('coverage side is invalid');
@@ -67,8 +58,6 @@ export function defineEnteredRectangle(
     mFt: requirePositive(mFt, 'M'),
     nFt: requirePositive(nFt, 'N'),
     side,
-    startClearFt: requireClearance(startClearFt, 'start clearance'),
-    endClearFt: requireClearance(endClearFt, 'end clearance'),
     source: 'entered',
   };
 }
@@ -82,8 +71,6 @@ export function captureCornerA(stableCamera: Pose, isStable: boolean): CornerA {
 export function defineWalkedRectangle(
   a: CornerA,
   bWorld: Pose,
-  startClearFt: number,
-  endClearFt: number,
   isBStable: boolean,
 ): RectangleDefinition {
   if (!isBStable) throw new Error('Corner B requires a stable normal pose');
@@ -103,8 +90,6 @@ export function defineWalkedRectangle(
     mFt: projected.forward,
     nFt: Math.abs(projected.right),
     side: projected.right < 0 ? 'left' : 'right',
-    startClearFt: requireClearance(startClearFt, 'start clearance'),
-    endClearFt: requireClearance(endClearFt, 'end clearance'),
     source: 'walked',
   };
 }

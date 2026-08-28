@@ -16,12 +16,20 @@ int main() {
                          route, 6000);
   assert(count > 0);
 
-  float minY = route[0].y;
-  float maxY = route[0].y;
+  float minY = 1e9f;
+  float maxY = -1e9f;
   int reversals = 0;
-  for (int index = 1; index < count; ++index) {
-    if (route[index].y < minY) minY = route[index].y;
-    if (route[index].y > maxY) maxY = route[index].y;
+  for (int index = 0; index < count; ++index) {
+    const float heading = routeRoverHeadingDeg(route, count, index) *
+                          (float)M_PI / 180.0f;
+    const float forwards[2] = {-ROVER_FOOTPRINT.rearFt, ROVER_FOOTPRINT.frontFt};
+    const float rights[2] = {-ROVER_FOOTPRINT.halfWidthFt, ROVER_FOOTPRINT.halfWidthFt};
+    for (float forward : forwards) for (float right : rights) {
+      const float y = route[index].y - right * sinf(heading) + forward * cosf(heading);
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+    }
+    if (index == 0) continue;
     if (route[index].reverse != route[index - 1].reverse) reversals++;
   }
 

@@ -150,7 +150,7 @@ class MissionProtocol {
 
   protocol_v2::AckV2 acceptCommand(
       const protocol_v2::CommandV2 &message, uint32_t nowMs,
-      bool calibrationAllowed = false) {
+      bool diagnosticMotionAllowed = false) {
     lastCommandWasDuplicate_ = false;
     for (uint8_t index = 0; index < commandCacheCount_; ++index) {
       const CommandCacheEntry &entry = commandCache_[index];
@@ -219,8 +219,8 @@ class MissionProtocol {
       result = state_ == S_IDLE || state_ == S_FAULT
           ? ack(message.epoch, message.commandId, F_NONE)
           : ack(message.epoch, message.commandId, F_ROUTE);
-    } else if (message.opcode >= 5 && message.opcode <= 7) {
-      if (state_ != S_IDLE || !hasCalibration_ || !calibrationAllowed) {
+    } else if (message.opcode == 5) {
+      if (state_ != S_IDLE || !hasCalibration_ || !diagnosticMotionAllowed) {
         result = ack(message.epoch, message.commandId, F_CALIBRATION);
       } else if (!poseFresh(nowMs)) {
         result = ack(message.epoch, message.commandId, F_POSE_TIMEOUT);

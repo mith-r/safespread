@@ -16,6 +16,7 @@ constexpr size_t CALIBRATION_SIZE = 24;
 constexpr size_t COMMAND_SIZE = 12;
 constexpr size_t ACK_SIZE = 16;
 constexpr size_t TELEMETRY_SIZE = 32;
+constexpr size_t ROUTE_PLAN_SIZE = 28;
 constexpr size_t FAULT_SAMPLE_SIZE = 32;
 
 struct PoseV2 {
@@ -86,6 +87,17 @@ struct TelemetryV2 {
   uint8_t faultCode;
   uint16_t droppedPackets;
   uint16_t poseAgeMs;
+};
+
+struct RoutePlanV2 {
+  uint8_t style;
+  uint16_t epoch;
+  uint16_t routeCount;
+  uint16_t passCount;
+  float leftRadiusFt;
+  float rightRadiusFt;
+  float beforeStartFt;
+  float beyondEndFt;
 };
 
 struct FaultSampleV2 {
@@ -381,6 +393,47 @@ inline bool parseTelemetryV2(const uint8_t *bytes, size_t size, TelemetryV2 &out
   parsed.faultCode = bytes[25];
   parsed.droppedPackets = detail::readU16(bytes, 26);
   parsed.poseAgeMs = detail::readU16(bytes, 28);
+  out = parsed;
+  return true;
+}
+
+inline bool buildRoutePlanV2(const RoutePlanV2 &value, uint8_t *out, size_t size) {
+  if (out == nullptr || size != ROUTE_PLAN_SIZE || value.style < 1 || value.style > 2 ||
+      value.routeCount == 0 || value.passCount == 0 ||
+      !std::isfinite(value.leftRadiusFt) || value.leftRadiusFt <= 0.0f ||
+      !std::isfinite(value.rightRadiusFt) || value.rightRadiusFt <= 0.0f ||
+      !std::isfinite(value.beforeStartFt) || value.beforeStartFt < 0.0f ||
+      !std::isfinite(value.beyondEndFt) || value.beyondEndFt < 0.0f) return false;
+  uint8_t bytes[ROUTE_PLAN_SIZE];
+  detail::begin(bytes, sizeof(bytes), 0x52, value.style);
+  detail::writeU16(bytes, 4, value.epoch);
+  detail::writeU16(bytes, 6, value.routeCount);
+  detail::writeU16(bytes, 8, value.passCount);
+  detail::writeFloat(bytes, 10, value.leftRadiusFt);
+  detail::writeFloat(bytes, 14, value.rightRadiusFt);
+  detail::writeFloat(bytes, 18, value.beforeStartFt);
+  detail::writeFloat(bytes, 22, value.beyondEndFt);
+  detail::finish(bytes, sizeof(bytes));
+  return detail::copyOut(bytes, sizeof(bytes), out, size);
+}
+
+inline bool parseRoutePlanV2(const uint8_t *bytes, size_t size, RoutePlanV2 &out) {
+  if (!detail::valid(bytes, size, ROUTE_PLAN_SIZE, 0x52) ||
+      bytes[3] < 1 || bytes[3] > 2) return false;
+  RoutePlanV2 parsed = {};
+  parsed.style = bytes[3];
+  parsed.epoch = detail::readU16(bytes, 4);
+  parsed.routeCount = detail::readU16(bytes, 6);
+  parsed.passCount = detail::readU16(bytes, 8);
+  parsed.leftRadiusFt = detail::readFloat(bytes, 10);
+  parsed.rightRadiusFt = detail::readFloat(bytes, 14);
+  parsed.beforeStartFt = detail::readFloat(bytes, 18);
+  parsed.beyondEndFt = detail::readFloat(bytes, 22);
+  if (parsed.routeCount == 0 || parsed.passCount == 0 ||
+      !std::isfinite(parsed.leftRadiusFt) || parsed.leftRadiusFt <= 0.0f ||
+      !std::isfinite(parsed.rightRadiusFt) || parsed.rightRadiusFt <= 0.0f ||
+      !std::isfinite(parsed.beforeStartFt) || parsed.beforeStartFt < 0.0f ||
+      !std::isfinite(parsed.beyondEndFt) || parsed.beyondEndFt < 0.0f) return false;
   out = parsed;
   return true;
 }

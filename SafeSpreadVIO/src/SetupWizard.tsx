@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useState } from 'react';
 import {
   Modal,
   Pressable,
@@ -8,33 +8,23 @@ import {
   TextInput,
   View,
 } from 'react-native';
-import { CalibrationRecord, PavementSurface } from './calibration';
-import { DEFAULT_MOUNT_CALIBRATION } from './hardwareGeometry';
 import { MissionLogFile } from './missionLog';
 import { Pose } from './poseMath';
+import { RoutePlanV2 } from './protocolV2';
 import { SetupAction, SetupState } from './setupMachine';
-
-export interface CalibrationFormValue {
-  cameraForwardFt: number;
-  cameraRightFt: number;
-  cameraYawDeg: number;
-  sprayForwardFt: number;
-  sprayRightFt: number;
-  surface: PavementSurface;
-}
 
 interface SetupWizardProps {
   state: SetupState;
   roverPose: Pose | null;
   trackingDetail: string;
   readinessReason: string;
-  calibration: CalibrationRecord | null;
+  turnRadii: { leftFt: number; rightFt: number; measured: boolean } | null;
+  routePlan: RoutePlanV2 | null;
   recentLogs: MissionLogFile[];
   busy: boolean;
-  calibrationProgress: string;
+  diagnosticProgress: string;
   dispatch(action: SetupAction): void;
-  onSaveCalibration(value: CalibrationFormValue): Promise<void>;
-  onRunCalibration(opcode: 5 | 6 | 7): Promise<void>;
+  onMeasureTurningRadii(): Promise<void>;
   onSelfTest(): Promise<void>;
   onArm(): Promise<void>;
   onStart(): Promise<void>;
@@ -104,7 +94,10 @@ function Field(props: { label: string; value: string; onChange(value: string): v
   );
 }
 
-function RectanglePreview({ state }: { state: SetupState }) {
+function RectanglePreview({ state, routePlan }: {
+  state: SetupState;
+  routePlan: RoutePlanV2 | null;
+}) {
   if (!state.rectangle) return null;
   const rectangle = state.rectangle;
   return (
@@ -114,7 +107,9 @@ function RectanglePreview({ state }: { state: SetupState }) {
         {rectangle.mFt.toFixed(1)} ft along M × {rectangle.nFt.toFixed(1)} ft across N
       </Text>
       <Text style={styles.body}>
-        Coverage: {rectangle.side.toUpperCase()} · Headland: {rectangle.startClearFt.toFixed(1)} ft before / {rectangle.endClearFt.toFixed(1)} ft beyond
+        Coverage: {rectangle.side.toUpperCase()} · {routePlan
+          ? `Calculated headland: ${routePlan.beforeStartFt.toFixed(2)} ft before / ${routePlan.beyondEndFt.toFixed(2)} ft beyond`
+          : 'Headland will be calculated by the rover before Start'}
       </Text>
       <View style={styles.rectangleGlyph}>
         <Text style={styles.glyphText}>A  ───── M ─────  far edge{`\n`}│{`\n`}N       opposite corner B{`\n`}│</Text>
@@ -127,26 +122,8 @@ export default function SetupWizard(props: SetupWizardProps) {
   const { state } = props;
   const [mText, setMText] = useState('40');
   const [nText, setNText] = useState('12');
-  const [startClearText, setStartClearText] = useState('8');
-  const [endClearText, setEndClearText] = useState('8');
   const [side, setSide] = useState<'right' | 'left'>('right');
-  const [cameraForward, setCameraForward] = useState(String(DEFAULT_MOUNT_CALIBRATION.cameraForwardFt));
-  const [cameraRight, setCameraRight] = useState(String(DEFAULT_MOUNT_CALIBRATION.cameraRightFt));
-  const [cameraYaw, setCameraYaw] = useState(String(DEFAULT_MOUNT_CALIBRATION.cameraYawDeg));
-  const [sprayForward, setSprayForward] = useState(String(DEFAULT_MOUNT_CALIBRATION.sprayForwardFt));
-  const [sprayRight, setSprayRight] = useState(String(DEFAULT_MOUNT_CALIBRATION.sprayRightFt));
-  const [surface, setSurface] = useState<PavementSurface>('concrete');
   const [showDiagnostics, setShowDiagnostics] = useState(false);
-
-  useEffect(() => {
-    if (!props.calibration) return;
-    setCameraForward(String(props.calibration.cameraForwardFt));
-    setCameraRight(String(props.calibration.cameraRightFt));
-    setCameraYaw(String(props.calibration.cameraYawDeg));
-    setSprayForward(String(props.calibration.sprayForwardFt));
-    setSprayRight(String(props.calibration.sprayRightFt));
-    setSurface(props.calibration.surface);
-  }, [props.calibration?.id]);
 
   const setEntered = () => {
     if (!props.roverPose) return;
@@ -156,19 +133,6 @@ export default function SetupWizard(props: SetupWizardProps) {
       mFt: numberValue(mText),
       nFt: numberValue(nText),
       side,
-      startClearFt: numberValue(startClearText),
-      endClearFt: numberValue(endClearText),
-    });
-  };
-
-  const saveCalibration = () => {
-    void props.onSaveCalibration({
-      cameraForwardFt: numberValue(cameraForward),
-      cameraRightFt: numberValue(cameraRight),
-      cameraYawDeg: numberValue(cameraYaw),
-      sprayForwardFt: numberValue(sprayForward),
-      sprayRightFt: numberValue(sprayRight),
-      surface,
     });
   };
 
@@ -213,6 +177,26 @@ export default function SetupWizard(props: SetupWizardProps) {
           </View>
         ) : null}
 
+        {['connection', 'rectangle'].includes(state.phase) ? (
+          <View style={styles.card}>
+            <Text style={styles.cardTitle}>Turning radius</Text>
+            <Text style={styles.body}>
+              {props.turnRadii
+                ? `${props.turnRadii.measured ? 'Measured' : 'Built-in'}: left ${props.turnRadii.leftFt.toFixed(2)} ft · right ${props.turnRadii.rightFt.toFixed(2)} ft`
+                : 'Waiting for the rover to report its current left and right radii.'}
+            </Text>
+            <Text style={styles.help}>
+              Do this dry, before setting the rectangle, on a large clear paved area. One press drives a left sweep and a right sweep using the existing steering signals. Keep at least 30 ft clear and press STOP if anything is unexpected.
+            </Text>
+            <Button
+              label="Measure both turning radii"
+              disabled={props.busy || state.connectionStatus !== 'connected' || !props.roverPose}
+              onPress={() => void props.onMeasureTurningRadii()}
+            />
+            {props.diagnosticProgress ? <Text style={styles.check}>{props.diagnosticProgress}</Text> : null}
+          </View>
+        ) : null}
+
         {state.phase === 'rectangle' ? (
           <View style={styles.card}>
             <Text style={styles.cardTitle}>2. Rectangle</Text>
@@ -231,11 +215,7 @@ export default function SetupWizard(props: SetupWizardProps) {
               <Button label="Use LEFT coverage (flip)" tone="secondary" onPress={() => props.dispatch({ type: 'CONFIRM_COVERAGE_SIDE' })} />
             ) : null}
 
-            <View style={styles.row}>
-              <Field label="Clear before A (ft)" value={startClearText} onChange={setStartClearText} />
-              <Field label="Clear beyond M (ft)" value={endClearText} onChange={setEndClearText} />
-            </View>
-            <RectanglePreview state={state} />
+            <RectanglePreview state={state} routePlan={props.routePlan} />
             <Button label="Confirm rectangle" disabled={!state.rectangle} onPress={() => props.dispatch({ type: 'CONTINUE' })} />
           </View>
         ) : null}
@@ -258,10 +238,19 @@ export default function SetupWizard(props: SetupWizardProps) {
               <Text style={styles.check}>{state.readiness.atStart ? '✓' : '○'} Rover at rectangle start</Text>
             )}
             <Text style={styles.check}>
-              {state.calibrationStatus === 'ready' ? '✓ Saved calibration available' : '△ Calibration optional — using built-in rover settings'}
+              {props.turnRadii
+                ? `✓ Turning radii: left ${props.turnRadii.leftFt.toFixed(2)} ft · right ${props.turnRadii.rightFt.toFixed(2)} ft`
+                : '△ Waiting for turning-radius status'}
             </Text>
+            {props.routePlan ? (
+              <Text style={styles.check}>
+                ✓ Required headland: {props.routePlan.beforeStartFt.toFixed(2)} ft before A / {props.routePlan.beyondEndFt.toFixed(2)} ft beyond M
+              </Text>
+            ) : (
+              <Text style={styles.check}>○ Required headland is calculated when the rover is configured.</Text>
+            )}
             <Text style={styles.check}>{state.loggingReady ? '✓ Mission log ready' : '△ Mission log unavailable; operation may continue'}</Text>
-            {state.phase === 'readiness' ? <Button label="Configure and Arm" disabled={props.busy} onPress={() => void props.onArm()} /> : null}
+            {state.phase === 'readiness' ? <Button label="Calculate headland and Arm" disabled={props.busy} onPress={() => void props.onArm()} /> : null}
             {state.phase === 'arming' ? <Text style={styles.waiting}>Waiting for Arm acknowledgement…</Text> : null}
             {state.phase === 'armed' ? <Button label="Start mission" disabled={props.busy} onPress={() => void props.onStart()} /> : null}
             {state.phase === 'starting' ? <Text style={styles.waiting}>Waiting for Running acknowledgement…</Text> : null}
@@ -289,40 +278,17 @@ export default function SetupWizard(props: SetupWizardProps) {
       <Modal visible={showDiagnostics} animationType="slide" onRequestClose={() => setShowDiagnostics(false)}>
         <View style={styles.screen}>
           <View style={styles.header}>
-            <Text style={styles.title}>Diagnostics & calibration</Text>
-            <Text style={styles.status}>
-              Only needed when the mount, steering, tires, load, phone, or firmware changes — the stored calibration carries between runs.
-            </Text>
+            <Text style={styles.title}>Diagnostics</Text>
+            <Text style={styles.status}>The retained self-test checks wiring and moves the rover briefly.</Text>
           </View>
           <ScrollView style={styles.scroll} contentContainerStyle={styles.content}>
             <View style={styles.card}>
-              <Text style={styles.cardTitle}>Pavement calibration</Text>
-              <Text style={styles.body}>Status: {state.calibrationStatus.toUpperCase()}.</Text>
-              <View style={styles.rowWrap}>
-                {(['asphalt', 'concrete', 'pavers', 'other'] as PavementSurface[]).map((value) => (
-                  <Choice key={value} active={surface === value} label={value} onPress={() => setSurface(value)} />
-                ))}
-              </View>
-              <View style={styles.row}>
-                <Field label="Camera forward ft" value={cameraForward} onChange={setCameraForward} />
-                <Field label="Camera right ft" value={cameraRight} onChange={setCameraRight} />
-              </View>
-              <View style={styles.row}>
-                <Field label="Camera yaw °" value={cameraYaw} onChange={setCameraYaw} />
-                <Field label="Spray forward ft" value={sprayForward} onChange={setSprayForward} />
-                <Field label="Spray right ft" value={sprayRight} onChange={setSprayRight} />
-              </View>
-              <Button label="Save mount and pavement calibration" disabled={props.busy} onPress={saveCalibration} />
+              <Text style={styles.cardTitle}>Run self-test</Text>
               <Text style={styles.help}>
-                Motion calibration is dry and moves the rover. Define the rectangle first, clear the stated pavement area, and press each step only once per completed movement. Steering requires seven presses; speed requires six. The retained self-test also moves forward and reverse.
+                Use Dry diagnostic and clear the area immediately around the rover. The test checks the PWM controller, steering, valve, forward motion, and reverse motion.
               </Text>
-              <View style={styles.rowWrap}>
-                <Button label="Next steering step" disabled={props.busy || !props.roverPose} onPress={() => void props.onRunCalibration(5)} />
-                <Button label="Next speed step" disabled={props.busy || !props.roverPose} onPress={() => void props.onRunCalibration(6)} />
-                <Button label="Verify reverse" disabled={props.busy || !props.roverPose} onPress={() => void props.onRunCalibration(7)} />
-                <Button label="Run self-test" tone="secondary" disabled={props.busy || !props.roverPose} onPress={() => void props.onSelfTest()} />
-              </View>
-              {props.calibrationProgress ? <Text style={styles.check}>{props.calibrationProgress}</Text> : null}
+              <Button label="Run self-test" tone="secondary" disabled={props.busy || !props.roverPose} onPress={() => void props.onSelfTest()} />
+              {props.diagnosticProgress ? <Text style={styles.check}>{props.diagnosticProgress}</Text> : null}
             </View>
           </ScrollView>
           <View style={styles.modalFooter}>

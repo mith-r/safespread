@@ -11,7 +11,18 @@
       "bundleIdentifier": "com.safespread.vio",
       "infoPlist": {
         "NSCameraUsageDescription": "SafeSpreadVIO uses the camera for visual-inertial position tracking.",
-        "NSBluetoothAlwaysUsageDescription": "SafeSpreadVIO connects to the SafeSpread rover over Bluetooth."
+        "NSBluetoothAlwaysUsageDescription": "SafeSpreadVIO connects to the SafeSpread rover over Bluetooth.",
+        "UIApplicationSceneManifest": {
+          "UIApplicationSupportsMultipleScenes": false,
+          "UISceneConfigurations": {
+            "UIWindowSceneSessionRoleApplication": [
+              {
+                "UISceneConfigurationName": "Default Configuration",
+                "UISceneDelegateClassName": "$(PRODUCT_MODULE_NAME).SceneDelegate"
+              }
+            ]
+          }
+        }
       }
     },
     "android": {
@@ -29,7 +40,8 @@
     "plugins": [
       "expo-dev-client",
       "expo-audio",
-      "expo-sharing"
+      "expo-sharing",
+      "./plugins/with-ios-scene-delegate"
     ]
   }
 }

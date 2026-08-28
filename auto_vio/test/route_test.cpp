@@ -235,11 +235,33 @@ int main() {
     }
     // Turns must not swing wildly off the plot; anything much beyond a
     // margin plus a turning radius would need clearance the user may not have.
-    assert(maxY <= FIELD + HEADLAND_MARGIN_FT + RL + 0.5f);
-    assert(minY >= -(HEADLAND_MARGIN_FT + RL + 0.5f));
+    assert(maxY <= FIELD + RL + ROVER_FOOTPRINT.frontFt + 0.5f);
+    assert(minY >= -(RL + ROVER_FOOTPRINT.frontFt + 0.5f));
     printf("route_test: route spans x %.1f..%.1f, y %.1f..%.1f "
            "(needs %.1f ft clear beyond each end)\n",
            minX, maxX, minY, maxY, maxY - FIELD);
+  }
+
+  // Once a turn begins, every corner of the known rover footprint remains on
+  // the outside of the rectangle. The straight runout/re-entry is the only
+  // time the rover crosses the boundary.
+  {
+    int turningPoints = 0;
+    for (int i = 0; i < n; ++i) {
+      if (!pts[i].turning) continue;
+      turningPoints++;
+      const float heading = routeRoverHeadingDeg(pts, n, i) * (float)M_PI / 180.0f;
+      float cornerMin = 1e9f, cornerMax = -1e9f;
+      const float forwards[2] = {-ROVER_FOOTPRINT.rearFt, ROVER_FOOTPRINT.frontFt};
+      const float rights[2] = {-ROVER_FOOTPRINT.halfWidthFt, ROVER_FOOTPRINT.halfWidthFt};
+      for (float forward : forwards) for (float right : rights) {
+        const float y = pts[i].y - right * sinf(heading) + forward * cosf(heading);
+        if (y < cornerMin) cornerMin = y;
+        if (y > cornerMax) cornerMax = y;
+      }
+      assert(cornerMin >= FIELD - 0.03f || cornerMax <= 0.03f);
+    }
+    assert(turningPoints > 3);
   }
 
   // --- a small plot still produces a complete route -----------------------

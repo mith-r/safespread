@@ -27,6 +27,8 @@ function poseEvent(
     mappingStatus: 'mapped',
     frameTimestampMs,
     emittedTimestampMs: frameTimestampMs + 5,
+    frameIntervalMs: 1000 / 60,
+    thermalState: 'nominal',
     sequence,
     ...values,
   };
@@ -61,6 +63,25 @@ describe('PosePipeline transforms and robust motion estimates', () => {
     expect(pose.sprayBar).toEqual({ x: 0, y: -0.5, heading: 0 });
     expect(pose.speedFps).toBe(0);
     expect(pose.courseDeg).toBeNull();
+  });
+
+  // An accepted pose goes to the rover on the frame it arrives, without waiting
+  // for a re-render, so everything describing that frame has to travel with it
+  // rather than being read back out of component state showing an older one.
+  it('carries its own frame metadata, timing, and thermal state', () => {
+    const pipeline = new PosePipeline(calibration);
+    const pose = accepted(pipeline, poseEvent(1, 100, {
+      frameIntervalMs: 52.4,
+      thermalState: 'serious',
+      trackingState: 'normal',
+      trackingReason: 'none',
+      mappingStatus: 'limited',
+    }), 10_000);
+    expect(pose.frameIntervalMs).toBe(52.4);
+    expect(pose.thermalState).toBe('serious');
+    expect(pose.trackingState).toBe('normal');
+    expect(pose.trackingReason).toBe('none');
+    expect(pose.mappingStatus).toBe('limited');
   });
 
   it('uses a robust five-sample estimate for velocity, course, and wrapped yaw', () => {
@@ -103,6 +124,8 @@ describe('PosePipeline drive rejection', () => {
       mappingStatus: 'notAvailable',
       frameTimestampMs: 2200,
       emittedTimestampMs: 2200,
+      frameIntervalMs: 0,
+      thermalState: 'nominal',
       sequence: 32,
     };
     expect(pipeline.ingest(status, 12_200)).toEqual({ ok: false, reason: 'tracking' });

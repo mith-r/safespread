@@ -94,12 +94,23 @@ inline int lookaheadRouteIndex(const PointT *route, int count, int fromIndex,
 
 /** Curvature that intersects a lookahead point in the rover's travel frame.
  *  Unlike a proportional steering command, this reproduces the radius of a
- *  planned arc instead of waiting for cross-track error before steering hard. */
-inline float purePursuitCurvature(float headingErrorDeg, float targetDistanceFt) {
-  if (!(targetDistanceFt > 0.01f) || !std::isfinite(headingErrorDeg) ||
-      !std::isfinite(targetDistanceFt)) return 0.0f;
+ *  planned arc instead of waiting for cross-track error before steering hard.
+ *
+ *  `minDistanceFt` floors the divisor. Aiming at a point that is nearly
+ *  underneath the rover asks for a circle tighter than any steering can
+ *  produce, so without a floor the command is pinned to full lock for the whole
+ *  approach to it -- which is what a segment-bounded lookahead produces every
+ *  time it runs out of segment and returns the cusp itself. Flooring turns the
+ *  last foot of an arc back into a proportional correction. */
+inline float purePursuitCurvature(float headingErrorDeg, float targetDistanceFt,
+                                  float minDistanceFt = 0.01f) {
+  if (!std::isfinite(headingErrorDeg) || !std::isfinite(targetDistanceFt) ||
+      !std::isfinite(minDistanceFt)) return 0.0f;
+  float distance = targetDistanceFt;
+  if (!(distance > minDistanceFt)) distance = minDistanceFt;
+  if (!(distance > 0.01f)) return 0.0f;
   const float radians = headingErrorDeg * static_cast<float>(M_PI) / 180.0f;
-  return 2.0f * std::sin(radians) / targetDistanceFt;
+  return 2.0f * std::sin(radians) / distance;
 }
 
 // --- Straight-line following ---------------------------------------------

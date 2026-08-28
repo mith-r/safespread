@@ -113,6 +113,15 @@ int main() {
   assert(parsedTelemetry.routeIndex == 4);
   assert(std::fabs(parsedTelemetry.crossTrackFt - -0.25f) < 0.0001f);
 
+  RoutePlanV2 plan = {2, 7, 1200, 7, 7.5f, 6.25f, 8.1f, 8.4f};
+  uint8_t planBytes[ROUTE_PLAN_SIZE];
+  assert(buildRoutePlanV2(plan, planBytes, sizeof(planBytes)));
+  RoutePlanV2 parsedPlan = {};
+  assert(parseRoutePlanV2(planBytes, sizeof(planBytes), parsedPlan));
+  assert(parsedPlan.style == 2 && parsedPlan.routeCount == 1200 && parsedPlan.passCount == 7);
+  assert(std::fabs(parsedPlan.leftRadiusFt - 7.5f) < 0.0001f);
+  assert(std::fabs(parsedPlan.beyondEndFt - 8.4f) < 0.0001f);
+
   FaultSampleV2 sample = {3, 7, 1234, 4, 5, 8, -0.1f, 2.25f, 0.8f,
                           1490, 1540, 5, 2, 3};
   uint8_t sampleBytes[FAULT_SAMPLE_SIZE];

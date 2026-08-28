@@ -14,6 +14,14 @@ export const MISSION_CSV_COLUMNS = [
   'steering_us',
   'throttle_us',
   'fault',
+  // Why a pose stream thinned out, and whether the frame it was reported in is
+  // the one it was reported in. Reconstructing either from the JSONL by hand is
+  // what the last investigation had to do.
+  'capture_age_ms',
+  'frame_interval_ms',
+  'thermal_state',
+  'pose_age_ms',
+  'relocalization_shift_ft',
 ] as const;
 
 const RECORD_KEYS: Record<(typeof MISSION_CSV_COLUMNS)[number], string> = {
@@ -32,6 +40,11 @@ const RECORD_KEYS: Record<(typeof MISSION_CSV_COLUMNS)[number], string> = {
   steering_us: 'steeringUs',
   throttle_us: 'throttleUs',
   fault: 'fault',
+  capture_age_ms: 'captureAgeMs',
+  frame_interval_ms: 'frameIntervalMs',
+  thermal_state: 'thermalState',
+  pose_age_ms: 'poseAgeMs',
+  relocalization_shift_ft: 'relocalizationShiftFt',
 };
 
 function csvCell(value: unknown): string {

@@ -70,6 +70,17 @@ export interface TelemetryV2 {
   poseAgeMs: number;
 }
 
+export interface RoutePlanV2 {
+  style: 1 | 2;
+  epoch: number;
+  routeCount: number;
+  passCount: number;
+  leftRadiusFt: number;
+  rightRadiusFt: number;
+  beforeStartFt: number;
+  beyondEndFt: number;
+}
+
 export interface FaultSampleV2 {
   flags: number;
   epoch: number;
@@ -266,6 +277,27 @@ export function parseTelemetryV2(bytes: Uint8Array): TelemetryV2 | null {
     droppedPackets: view.getUint16(26, true),
     poseAgeMs: view.getUint16(28, true),
   };
+}
+
+export function parseRoutePlanV2(bytes: Uint8Array): RoutePlanV2 | null {
+  if (!isPacket(bytes, 28, 0x52) || bytes[3] < 1 || bytes[3] > 2) return null;
+  const view = viewOf(bytes);
+  const parsed: RoutePlanV2 = {
+    style: bytes[3] as 1 | 2,
+    epoch: view.getUint16(4, true),
+    routeCount: view.getUint16(6, true),
+    passCount: view.getUint16(8, true),
+    leftRadiusFt: view.getFloat32(10, true),
+    rightRadiusFt: view.getFloat32(14, true),
+    beforeStartFt: view.getFloat32(18, true),
+    beyondEndFt: view.getFloat32(22, true),
+  };
+  if (parsed.routeCount === 0 || parsed.passCount === 0 ||
+      !Number.isFinite(parsed.leftRadiusFt) || parsed.leftRadiusFt <= 0 ||
+      !Number.isFinite(parsed.rightRadiusFt) || parsed.rightRadiusFt <= 0 ||
+      !Number.isFinite(parsed.beforeStartFt) || parsed.beforeStartFt < 0 ||
+      !Number.isFinite(parsed.beyondEndFt) || parsed.beyondEndFt < 0) return null;
+  return parsed;
 }
 
 export function parseFaultSampleV2(bytes: Uint8Array): FaultSampleV2 | null {

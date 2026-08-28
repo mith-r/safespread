@@ -13,7 +13,6 @@ import { Pose } from './poseMath';
 export type SetupPhase =
   | 'connection'
   | 'rectangle'
-  | 'calibration'
   | 'readiness'
   | 'arming'
   | 'armed'
@@ -23,7 +22,6 @@ export type SetupPhase =
   | 'fault';
 
 export type RectangleMode = 'entered' | 'walked';
-export type CalibrationStatus = 'missing' | 'stale' | 'ready';
 
 export interface SetupReadiness {
   trackingNormal: boolean;
@@ -39,7 +37,6 @@ export interface SetupState {
   rectangle: RectangleDefinition | null;
   cornerA: CornerA | null;
   coverageSideConfirmed: boolean;
-  calibrationStatus: CalibrationStatus;
   wet: boolean;
   loggingReady: boolean;
   readiness: SetupReadiness;
@@ -62,19 +59,14 @@ export type SetupAction =
       mFt: number;
       nFt: number;
       side: CoverageSide;
-      startClearFt: number;
-      endClearFt: number;
     }
   | { type: 'CAPTURE_CORNER_A'; pose: Pose; stable: boolean }
   | {
       type: 'CAPTURE_CORNER_B';
       pose: Pose;
       stable: boolean;
-      startClearFt: number;
-      endClearFt: number;
     }
   | { type: 'CONFIRM_COVERAGE_SIDE' }
-  | { type: 'SET_CALIBRATION_STATUS'; status: CalibrationStatus }
   | { type: 'SET_WET_MODE'; wet: boolean }
   | { type: 'SET_LOGGING_READY'; ready: boolean }
   | { type: 'SET_READINESS'; trackingNormal: boolean; poseStable: boolean; atStart: boolean }
@@ -130,7 +122,6 @@ export function initialSetupState(): SetupState {
     rectangle: null,
     cornerA: null,
     coverageSideConfirmed: false,
-    calibrationStatus: 'missing',
     wet: false,
     loggingReady: false,
     readiness: { ...NOT_READY },
@@ -153,7 +144,6 @@ function stoppedState(state: SetupState): SetupState {
     phase: connected ? 'rectangle' : 'connection',
     connectionStatus: state.connectionStatus,
     compatible: connected,
-    calibrationStatus: state.calibrationStatus,
   };
 }
 
@@ -207,8 +197,6 @@ export function setupReducer(state: SetupState, action: SetupAction): SetupState
             action.mFt,
             action.nFt,
             action.side,
-            action.startClearFt,
-            action.endClearFt,
           ),
           coverageSideConfirmed: action.side === 'right',
           validationError: null,
@@ -241,8 +229,6 @@ export function setupReducer(state: SetupState, action: SetupAction): SetupState
         const rectangle = defineWalkedRectangle(
           state.cornerA,
           action.pose,
-          action.startClearFt,
-          action.endClearFt,
           action.stable,
         );
         return {
@@ -258,9 +244,6 @@ export function setupReducer(state: SetupState, action: SetupAction): SetupState
     case 'CONFIRM_COVERAGE_SIDE':
       if (!state.rectangle) return fail(state, 'Define the rectangle before confirming its side.');
       return { ...state, coverageSideConfirmed: true, validationError: null };
-
-    case 'SET_CALIBRATION_STATUS':
-      return { ...state, calibrationStatus: action.status, validationError: null };
 
     case 'SET_WET_MODE':
       return { ...state, wet: action.wet, validationError: null };
@@ -295,12 +278,6 @@ export function setupReducer(state: SetupState, action: SetupAction): SetupState
         if (state.rectangle.side === 'left' && !state.coverageSideConfirmed) {
           return fail(state, 'Left coverage side must be explicitly confirmed.');
         }
-        // Stored calibration carries between runs. Calibration and diagnostics
-        // remain available from the fixed header instead of blocking every
-        // mission as a required wizard step.
-        return { ...state, phase: 'readiness', validationError: null };
-      }
-      if (state.phase === 'calibration') {
         return { ...state, phase: 'readiness', validationError: null };
       }
       return fail(state, 'Continue is not available in the current phase.');

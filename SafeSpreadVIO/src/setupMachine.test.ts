@@ -32,11 +32,8 @@ function enteredReadyState(options: { wet?: boolean; loggingReady?: boolean } = 
       mFt: 20,
       nFt: 8,
       side: 'right',
-      startClearFt: 19,
-      endClearFt: 12,
     },
     { type: 'CONTINUE' },
-    { type: 'SET_CALIBRATION_STATUS', status: 'ready' },
     { type: 'SET_WET_MODE', wet: options.wet ?? false },
     { type: 'SET_LOGGING_READY', ready: options.loggingReady ?? true },
     {
@@ -73,8 +70,6 @@ describe('setupReducer', () => {
         type: 'CAPTURE_CORNER_B',
         pose: { x: 2, y: 40, heading: 90 },
         stable: true,
-        startClearFt: 8,
-        endClearFt: 9,
       },
     );
     expect(state.rectangle).toMatchObject({ source: 'walked', mFt: 20, nFt: 8, side: 'left' });
@@ -101,8 +96,6 @@ describe('setupReducer', () => {
         type: 'CAPTURE_CORNER_B',
         pose: { x: 8, y: 40, heading: 0 },
         stable: false,
-        startClearFt: 8,
-        endClearFt: 9,
       },
     );
     expect(state.rectangle).toBeNull();
@@ -113,12 +106,9 @@ describe('setupReducer', () => {
         type: 'CAPTURE_CORNER_B',
         pose: { x: 8, y: 40, heading: 0 },
         stable: true,
-        startClearFt: 8,
-        endClearFt: 9,
       },
       { type: 'CONFIRM_COVERAGE_SIDE' },
       { type: 'CONTINUE' },
-      { type: 'SET_CALIBRATION_STATUS', status: 'ready' },
       { type: 'SET_LOGGING_READY', ready: true },
       {
         type: 'SET_READINESS',
@@ -132,7 +122,7 @@ describe('setupReducer', () => {
     expect(state.validationError).toMatch(/corner A/i);
   });
 
-  it('rejects invalid dimensions and negative headland before leaving rectangle setup', () => {
+  it('rejects invalid dimensions before leaving rectangle setup', () => {
     let state = reduce(
       connectedState(),
       { type: 'SELECT_RECTANGLE_MODE', mode: 'entered' },
@@ -142,8 +132,6 @@ describe('setupReducer', () => {
         mFt: 0,
         nFt: 8,
         side: 'right',
-        startClearFt: -1,
-        endClearFt: 4,
       },
       { type: 'CONTINUE' },
     );
@@ -162,8 +150,6 @@ describe('setupReducer', () => {
         mFt: 20,
         nFt: 8,
         side: 'left',
-        startClearFt: 8,
-        endClearFt: 9,
       },
       { type: 'CONTINUE' },
     );
@@ -194,27 +180,6 @@ describe('setupReducer', () => {
     expect(updated.validationError).toBe(invalid.validationError);
   });
 
-  it.each(['missing', 'stale'] as const)(
-    'permits wet and dry arming with %s calibration',
-    (status) => {
-      let wet = enteredReadyState({ wet: true });
-      wet = reduce(
-        wet,
-        { type: 'SET_CALIBRATION_STATUS', status },
-        { type: 'REQUEST_ARM' },
-      );
-      expect(wet.phase).toBe('arming');
-
-      let dry = enteredReadyState();
-      dry = reduce(
-        dry,
-        { type: 'SET_CALIBRATION_STATUS', status },
-        { type: 'REQUEST_ARM' },
-      );
-      expect(dry.phase).toBe('arming');
-    },
-  );
-
   it('permits wet and dry arming when logging is unavailable', () => {
     const wet = setupReducer(
       enteredReadyState({ wet: true, loggingReady: false }),
@@ -241,7 +206,7 @@ describe('setupReducer', () => {
   });
 
   it.each([
-    'connection', 'rectangle', 'calibration', 'readiness',
+    'connection', 'rectangle', 'readiness',
     'arming', 'armed', 'starting', 'running', 'complete', 'fault',
   ] as const)('accepts Stop from %s', (phase) => {
     const state = setupReducer({ ...initialSetupState(), phase }, { type: 'STOP' });

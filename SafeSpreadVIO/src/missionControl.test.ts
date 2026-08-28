@@ -7,6 +7,7 @@ import {
   MissionTransport,
 } from './missionControl';
 import { RectangleDefinition } from './rectangle';
+import { RoutePlanV2 } from './protocolV2';
 
 const rectangle: RectangleDefinition = {
   originWorld: { x: 0, y: 0, heading: 0 },
@@ -14,8 +15,6 @@ const rectangle: RectangleDefinition = {
   mFt: 20,
   nFt: 8,
   side: 'right',
-  startClearFt: 4,
-  endClearFt: 6,
   source: 'entered',
 };
 const calibration: CalibrationWire = {
@@ -41,6 +40,7 @@ class FakeTransport implements MissionTransport {
   writes: Uint8Array[] = [];
   compatibilityStops = 0;
   listener: ((packet: Uint8Array) => void) | null = null;
+  planListener: ((plan: RoutePlanV2) => void) | null = null;
   onWrite?: (packet: Uint8Array, writeNumber: number) => void | Promise<void>;
 
   async writeWithResponse(packet: Uint8Array) {
@@ -52,7 +52,23 @@ class FakeTransport implements MissionTransport {
     this.listener = listener;
     return () => { this.listener = null; };
   }
+  subscribeRoutePlan(listener: (plan: RoutePlanV2) => void) {
+    this.planListener = listener;
+    return () => { this.planListener = null; };
+  }
   emit(packet: Uint8Array) { this.listener?.(packet); }
+  emitPlan(epoch = 7) {
+    this.planListener?.({
+      style: 2,
+      epoch,
+      routeCount: 800,
+      passCount: 5,
+      leftRadiusFt: 7.5,
+      rightRadiusFt: 6.25,
+      beforeStartFt: 8.1,
+      beyondEndFt: 8.4,
+    });
+  }
 }
 
 function packetId(packet: Uint8Array) {
@@ -62,6 +78,7 @@ function packetId(packet: Uint8Array) {
 function autoAckConfiguration(transport: FakeTransport, epoch = 7) {
   transport.onWrite = (packet) => {
     const state = packet[1] === 0x44 ? 1 : 0;
+    if (packet[1] === 0x44) transport.emitPlan(epoch);
     transport.emit(ack(epoch, packetId(packet), state));
   };
 }
@@ -169,10 +186,11 @@ describe('MissionControl ordering and acknowledgements', () => {
     await expect(control.configure(rectangle, calibration)).rejects.toThrow('calibration');
   });
 
-  it('prepares and runs dry calibration while idle, then reuses that setup for configure', async () => {
+  it('prepares and runs one dry radius measurement while idle, then reuses setup', async () => {
     const transport = new FakeTransport();
     transport.onWrite = (packet) => {
       const state = packet[1] === 0x44 ? 1 : 0;
+      if (packet[1] === 0x44) transport.emitPlan();
       transport.emit(ack(7, packetId(packet), state));
     };
     const control = new MissionControl(transport, 7, () => true, {
@@ -180,26 +198,26 @@ describe('MissionControl ordering and acknowledgements', () => {
       retries: 0,
       dryMode: true,
     });
-    await control.prepareCalibration(calibration);
-    await control.runCalibrationStep(5);
+    await control.prepareDiagnostics(calibration);
+    await control.measureTurningRadii();
     await control.configure(rectangle, calibration);
 
     expect(transport.writes.map((packet) => [packet[1], packet[3]])).toEqual([
       [0x4b, 0],
       [0x43, 5],
-      [0x44, 6],
+      [0x44, 2],
     ]);
     expect(control.state).toBe('configured');
   });
 
-  it('requires dry mode, a prepared calibration, and a fresh pose for calibration motion', async () => {
+  it('requires dry mode, prepared diagnostics, and a fresh pose for radius measurement', async () => {
     const wetTransport = new FakeTransport();
     const wet = new MissionControl(wetTransport, 7, () => true, {
       timeoutMs: 5,
       retries: 0,
       dryMode: false,
     });
-    await expect(wet.runCalibrationStep(5)).rejects.toThrow(/dry/i);
+    await expect(wet.measureTurningRadii()).rejects.toThrow(/dry/i);
 
     const transport = new FakeTransport();
     const control = new MissionControl(transport, 7, () => false, {
@@ -207,10 +225,10 @@ describe('MissionControl ordering and acknowledgements', () => {
       retries: 0,
       dryMode: true,
     });
-    await expect(control.runCalibrationStep(6)).rejects.toThrow(/prepared/i);
+    await expect(control.measureTurningRadii()).rejects.toThrow(/prepared/i);
     transport.onWrite = (packet) => transport.emit(ack(7, packetId(packet), 0));
-    await control.prepareCalibration(calibration);
-    await expect(control.runCalibrationStep(6)).rejects.toThrow(/fresh/i);
+    await control.prepareDiagnostics(calibration);
+    await expect(control.measureTurningRadii()).rejects.toThrow(/fresh/i);
   });
 
   it('requests the frozen fault dump while idle without requiring calibration identity', async () => {
@@ -229,7 +247,7 @@ describe('MissionControl ordering and acknowledgements', () => {
     const control = new MissionControl(transport, 7, () => true, { timeoutMs: 5, retries: 0 });
     await expect(control.selfTest()).rejects.toThrow(/prepared/i);
     transport.onWrite = (packet) => transport.emit(ack(7, packetId(packet), 0));
-    await control.prepareCalibration(calibration);
+    await control.prepareDiagnostics(calibration);
     await control.selfTest();
     expect(transport.writes.map((packet) => [packet[1], packet[3]])).toEqual([
       [0x4b, 0],
