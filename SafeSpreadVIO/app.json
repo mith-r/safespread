@@ -41,7 +41,8 @@
       "expo-dev-client",
       "expo-audio",
       "expo-sharing",
-      "./plugins/with-ios-scene-delegate"
+      "./plugins/with-ios-scene-delegate",
+      "./plugins/withDisableScriptSandbox"
     ]
   }
 }
