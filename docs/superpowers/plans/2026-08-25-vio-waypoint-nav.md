@@ -1,5 +1,9 @@
 # Phone-VIO Waypoint Navigation Implementation Plan
 
+> **Historical only.** This plan is not a current product requirement and must
+> not be used as deployment source. The canonical behavior is documented on
+> `main`; in particular, do not restore any walked-corner setup workflow.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Replace `auto.ino`'s open-loop, mis-spaced dead reckoning with a system where an iPhone's ARKit visual-inertial pose is the sole position/heading source, streamed over BLE to a new ESP32 sketch that drives a bar-width-correct waypoint grid.

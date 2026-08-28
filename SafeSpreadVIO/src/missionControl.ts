@@ -14,6 +14,15 @@ export interface CalibrationWire {
   sprayRightFt: number;
 }
 
+/**
+ * The rover plans its own route and always runs at that route's minimum
+ * headland, so Configure tells it the pavement is unbounded instead of asking
+ * it to fit an operator-entered clearance. The requirement it actually needs
+ * comes back in its "Needs clear pavement" log line and replaces the app's
+ * preview estimate (see ROVER_HEADLAND in setupMachine).
+ */
+export const UNBOUNDED_CLEARANCE_FT = 1000;
+
 export interface MissionTransport {
   writeWithResponse(packet: Uint8Array): Promise<void>;
   writeCompatibilityStop(): Promise<void>;
@@ -67,7 +76,9 @@ export class MissionControl {
     this.timeoutMs = options.timeoutMs ?? 750;
     this.retries = options.retries ?? 2;
     this.dryMode = options.dryMode ?? true;
-    this.preferForwardOnly = options.preferForwardOnly ?? true;
+    // Car-style three-point turns by default: they need ~7 ft of headland
+    // instead of the ~18 ft a forward-only loop between adjacent lanes costs.
+    this.preferForwardOnly = options.preferForwardOnly ?? false;
     this.unsubscribe = transport.subscribeAck((packet) => this.receiveAck(packet));
   }
 
@@ -104,8 +115,8 @@ export class MissionControl {
         commandId: rectangleCommandId,
         mFt: definition.mFt,
         nFt: definition.nFt,
-        startClearFt: definition.startClearFt,
-        endClearFt: definition.endClearFt,
+        startClearFt: UNBOUNDED_CLEARANCE_FT,
+        endClearFt: UNBOUNDED_CLEARANCE_FT,
         calibrationId: calibration.id,
       }), rectangleCommandId, generation);
       this.requireAck(rectangleAck, [1], calibration.id);

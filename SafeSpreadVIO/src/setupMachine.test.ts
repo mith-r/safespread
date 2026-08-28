@@ -1,9 +1,11 @@
 import { crc16Ccitt, FaultSampleV2 } from './protocolV2';
+import { estimateHeadland } from './routePlan';
 import {
   assembleFaultPackets,
   initialSetupState,
   isAuthoritativeLogReady,
   MissionOperationGate,
+  ROVER_HEADLAND_WARN_FT,
   setupReducer,
   SetupState,
 } from './setupMachine';
@@ -25,21 +27,17 @@ function connectedState(): SetupState {
 function enteredReadyState(options: { wet?: boolean; loggingReady?: boolean } = {}): SetupState {
   return reduce(
     connectedState(),
-    { type: 'SELECT_RECTANGLE_MODE', mode: 'entered' },
     {
       type: 'SET_ENTERED_RECTANGLE',
       pose: atA,
       mFt: 20,
       nFt: 8,
       side: 'right',
-      startClearFt: 19,
-      endClearFt: 12,
     },
     { type: 'CONTINUE' },
     { type: 'SET_CALIBRATION_STATUS', status: 'ready' },
     { type: 'SET_WET_MODE', wet: options.wet ?? false },
     { type: 'SET_LOGGING_READY', ready: options.loggingReady ?? true },
-    { type: 'CONTINUE' },
     {
       type: 'SET_READINESS',
       trackingNormal: true,
@@ -65,63 +63,9 @@ describe('setupReducer', () => {
     expect(state.phase).toBe('running');
   });
 
-  it('builds a walked opposite-corner rectangle and requires explicit left-side confirmation', () => {
-    let state = reduce(
-      connectedState(),
-      { type: 'SELECT_RECTANGLE_MODE', mode: 'walked' },
-      { type: 'CAPTURE_CORNER_A', pose: atA, stable: true },
-      {
-        type: 'CAPTURE_CORNER_B',
-        pose: { x: 2, y: 40, heading: 90 },
-        stable: true,
-        startClearFt: 8,
-        endClearFt: 9,
-      },
-    );
-    expect(state.rectangle).toMatchObject({ source: 'walked', mFt: 20, nFt: 8, side: 'left' });
-    state = setupReducer(state, { type: 'CONTINUE' });
-    expect(state.phase).toBe('rectangle');
-    expect(state.validationError).toMatch(/left.*confirm/i);
-    state = reduce(state, { type: 'CONFIRM_COVERAGE_SIDE' }, { type: 'CONTINUE' });
-    expect(state.phase).toBe('calibration');
-  });
-
-  it('rejects unstable corner captures and requires return to A before walked arming', () => {
-    let state = reduce(
-      connectedState(),
-      { type: 'SELECT_RECTANGLE_MODE', mode: 'walked' },
-      { type: 'CAPTURE_CORNER_A', pose: atA, stable: false },
-    );
-    expect(state.cornerA).toBeNull();
-    expect(state.validationError).toMatch(/stable/i);
-
-    state = reduce(
-      state,
-      { type: 'CAPTURE_CORNER_A', pose: atA, stable: true },
-      {
-        type: 'CAPTURE_CORNER_B',
-        pose: { x: 8, y: 40, heading: 0 },
-        stable: false,
-        startClearFt: 8,
-        endClearFt: 9,
-      },
-    );
-    expect(state.rectangle).toBeNull();
-
-    state = reduce(
-      state,
-      {
-        type: 'CAPTURE_CORNER_B',
-        pose: { x: 8, y: 40, heading: 0 },
-        stable: true,
-        startClearFt: 8,
-        endClearFt: 9,
-      },
-      { type: 'CONFIRM_COVERAGE_SIDE' },
-      { type: 'CONTINUE' },
-      { type: 'SET_CALIBRATION_STATUS', status: 'ready' },
-      { type: 'SET_LOGGING_READY', ready: true },
-      { type: 'CONTINUE' },
+  it('requires the rover be at the rectangle start before arming', () => {
+    const state = reduce(
+      enteredReadyState(),
       {
         type: 'SET_READINESS',
         trackingNormal: true,
@@ -131,21 +75,34 @@ describe('setupReducer', () => {
       { type: 'REQUEST_ARM' },
     );
     expect(state.phase).toBe('readiness');
-    expect(state.validationError).toMatch(/corner A/i);
+    expect(state.validationError).toMatch(/rectangle start/i);
   });
 
-  it('rejects invalid dimensions and negative headland before leaving rectangle setup', () => {
+  describe('MOUNT_CALIBRATION_CHANGED', () => {
+    it('drops the rectangle and returns to rectangle setup from readiness', () => {
+      const state = setupReducer(enteredReadyState(), { type: 'MOUNT_CALIBRATION_CHANGED' });
+      expect(state.phase).toBe('rectangle');
+      expect(state.rectangle).toBeNull();
+      expect(state.warning).toMatch(/set the rectangle again/i);
+    });
+
+    it('is a no-op without a rectangle or during a mission', () => {
+      const idle = connectedState();
+      expect(setupReducer(idle, { type: 'MOUNT_CALIBRATION_CHANGED' })).toBe(idle);
+      const running = { ...enteredReadyState(), phase: 'running' as const };
+      expect(setupReducer(running, { type: 'MOUNT_CALIBRATION_CHANGED' })).toBe(running);
+    });
+  });
+
+  it('rejects invalid dimensions before leaving rectangle setup', () => {
     let state = reduce(
       connectedState(),
-      { type: 'SELECT_RECTANGLE_MODE', mode: 'entered' },
       {
         type: 'SET_ENTERED_RECTANGLE',
         pose: atA,
         mFt: 0,
         nFt: 8,
         side: 'right',
-        startClearFt: -1,
-        endClearFt: 4,
       },
       { type: 'CONTINUE' },
     );
@@ -154,25 +111,80 @@ describe('setupReducer', () => {
     expect(state.validationError).toBeTruthy();
   });
 
+  it('plans the headland itself instead of asking the operator', () => {
+    const state = enteredReadyState();
+    const planned = estimateHeadland(20, 8);
+    expect(state.rectangle).toMatchObject({
+      startClearFt: planned?.beforeStartFt,
+      endClearFt: planned?.beyondEndFt,
+      headlandSource: 'estimated',
+    });
+  });
+
+  describe('ROVER_HEADLAND', () => {
+    it('adopts the rover-reported requirement after configure without a warning when it matches', () => {
+      const armed = setupReducer(enteredReadyState(), { type: 'REQUEST_ARM' });
+      const estimate = armed.rectangle!;
+      const state = setupReducer(armed, {
+        type: 'ROVER_HEADLAND',
+        beforeStartFt: estimate.startClearFt + 0.1,
+        beyondEndFt: estimate.endClearFt,
+      });
+      expect(state.phase).toBe('arming');
+      expect(state.rectangle).toMatchObject({
+        startClearFt: estimate.startClearFt + 0.1,
+        endClearFt: estimate.endClearFt,
+        headlandSource: 'rover',
+      });
+      expect(state.warning).toBeNull();
+    });
+
+    it('warns when the rover needs more room than the preview estimated', () => {
+      const armed = setupReducer(enteredReadyState({ loggingReady: false }), { type: 'REQUEST_ARM' });
+      const estimate = armed.rectangle!;
+      const state = setupReducer(armed, {
+        type: 'ROVER_HEADLAND',
+        beforeStartFt: estimate.startClearFt + ROVER_HEADLAND_WARN_FT + 1,
+        beyondEndFt: estimate.endClearFt,
+      });
+      expect(state.rectangle?.headlandSource).toBe('rover');
+      expect(state.warning).toMatch(/re-check/i);
+      expect(state.warning).toMatch(/log/i);
+    });
+
+    it('ignores a rover headland line when no rectangle is defined', () => {
+      const before = connectedState();
+      const after = setupReducer(before, { type: 'ROVER_HEADLAND', beforeStartFt: 5, beyondEndFt: 5 });
+      expect(after).toBe(before);
+    });
+
+    it('reports malformed rover figures as a validation error', () => {
+      const state = setupReducer(enteredReadyState(), {
+        type: 'ROVER_HEADLAND',
+        beforeStartFt: -2,
+        beyondEndFt: 5,
+      });
+      expect(state.rectangle?.headlandSource).toBe('estimated');
+      expect(state.validationError).toMatch(/rover headland/i);
+    });
+  });
+
   it('requires explicit confirmation for an entered LEFT coverage side', () => {
     let state = reduce(
       connectedState(),
-      { type: 'SELECT_RECTANGLE_MODE', mode: 'entered' },
       {
         type: 'SET_ENTERED_RECTANGLE',
         pose: atA,
         mFt: 20,
         nFt: 8,
         side: 'left',
-        startClearFt: 8,
-        endClearFt: 9,
       },
       { type: 'CONTINUE' },
     );
     expect(state.phase).toBe('rectangle');
     expect(state.validationError).toMatch(/left.*confirm/i);
     state = reduce(state, { type: 'CONFIRM_COVERAGE_SIDE' }, { type: 'CONTINUE' });
-    expect(state.phase).toBe('calibration');
+    expect(state.phase).toBe('readiness');
   });
 
   it('does not advance for incompatible firmware', () => {
@@ -244,7 +256,7 @@ describe('setupReducer', () => {
   });
 
   it.each([
-    'connection', 'rectangle', 'calibration', 'readiness',
+    'connection', 'rectangle', 'readiness',
     'arming', 'armed', 'starting', 'running', 'complete', 'fault',
   ] as const)('accepts Stop from %s', (phase) => {
     const state = setupReducer({ ...initialSetupState(), phase }, { type: 'STOP' });

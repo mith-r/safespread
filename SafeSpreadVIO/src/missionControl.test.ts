@@ -3,6 +3,7 @@ import {
   CalibrationWire,
   MissionControl,
   MissionTransport,
+  UNBOUNDED_CLEARANCE_FT,
 } from './missionControl';
 import { RectangleDefinition } from './rectangle';
 
@@ -14,6 +15,7 @@ const rectangle: RectangleDefinition = {
   side: 'right',
   startClearFt: 4,
   endClearFt: 6,
+  headlandSource: 'estimated',
   source: 'entered',
 };
 const calibration: CalibrationWire = {
@@ -145,9 +147,21 @@ describe('MissionControl ordering and acknowledgements', () => {
     expect(transport.writes.map((packet) => [packet[1], packet[3]])).toEqual([
       [0x4b, 0],
       [0x43, 5],
-      [0x44, 6],
+      [0x44, 2], // dry, right side, three-point turns (no forward-only preference)
     ]);
     expect(control.state).toBe('configured');
+  });
+
+  it('tells the rover the pavement is unbounded so it runs at its own minimum headland', async () => {
+    const transport = new FakeTransport();
+    await configuredControl(transport);
+    const packet = transport.writes.find((written) => written[1] === 0x44);
+    expect(packet).toBeDefined();
+    const view = new DataView(packet!.buffer, packet!.byteOffset, packet!.byteLength);
+    expect(view.getFloat32(10, true)).toBeCloseTo(rectangle.mFt, 4);
+    expect(view.getFloat32(14, true)).toBeCloseTo(rectangle.nFt, 4);
+    expect(view.getFloat32(18, true)).toBe(UNBOUNDED_CLEARANCE_FT);
+    expect(view.getFloat32(22, true)).toBe(UNBOUNDED_CLEARANCE_FT);
   });
 
   it('requires dry mode, a prepared calibration, and a fresh pose for calibration motion', async () => {

@@ -81,9 +81,10 @@ int main() {
   assert(protocol.takePose(consumed) && consumed.sequence == 4);
   assert(!protocol.takePose(consumed));
   assert(protocol.acceptPose(pose(5), 1020));
-  assert(!protocol.acceptPose(pose(5), 1021));
-  assert(protocol.lastPoseRejectFault() == F_POSE_INVALID);
-  assert(!protocol.acceptPose(pose(4), 1022));
+  assert(!protocol.acceptPose(pose(5), 1021));   // duplicate: dropped, not blamed
+  assert(protocol.lastPoseRejectFault() == F_NONE);
+  assert(!protocol.acceptPose(pose(4), 1022));   // regression: dropped, not blamed
+  assert(protocol.lastPoseRejectFault() == F_NONE);
 
   PoseV2 tooFast = pose(6);
   tooFast.speedFps = 8.01f;
@@ -135,6 +136,63 @@ int main() {
   assert(protocol.acceptPose(pose(24, 10, 8, 4), 2030));
   assert(protocol.droppedPoses() == 1);
   assert(protocol.takePose(consumed) && consumed.sequence == 24);
+
+  // Accepting a rectangle changes the coordinate frame poses arrive in (the app
+  // streams the rover's raw world pose until Configure, then switches to
+  // rectangle-relative coordinates). That one-time shift is larger than the
+  // per-sample innovation, so acceptRectangle must clear the pose baseline the
+  // way acceptCalibration does; otherwise the first pose of the mission reads as
+  // F_POSE_JUMP and the mission faults at its first step.
+  MissionProtocol frameSwitch;
+  assert(frameSwitch.acceptCalibration(calibration(), 3000).faultCode == F_NONE);
+  PoseV2 worldPose = pose(1, 20);
+  worldPose.y = -2.0f;   // rover's raw VIO position before it is configured
+  assert(frameSwitch.acceptPose(worldPose, 3000));
+  AckV2 rectAck = frameSwitch.acceptRectangle(rectangle(), 3010);
+  assert(rectAck.state == S_CONFIGURED && rectAck.faultCode == F_NONE);
+  PoseV2 framePose = pose(2, 20);
+  framePose.y = 0.0f;    // same rover, now at the rectangle origin: a 2 ft shift
+  assert(frameSwitch.acceptPose(framePose, 3020));
+  assert(frameSwitch.lastPoseRejectFault() == F_NONE);
+  // A genuine jump within the rectangle frame is still rejected afterwards.
+  PoseV2 realJump = pose(3, 20);
+  realJump.y = 4.0f;
+  assert(!frameSwitch.acceptPose(realJump, 3030));
+  assert(frameSwitch.lastPoseRejectFault() == F_POSE_JUMP);
+
+  // Transport artifacts are dropped without a fault code, so a coalesced BLE
+  // write cannot fault an armed mission: duplicates/regressions, same-tick
+  // pairs, and stale ages reject with F_NONE. Real corruption still blames
+  // the stream (checked above: accel, position and heading jumps).
+  MissionProtocol artifacts;
+  assert(artifacts.acceptCalibration(calibration(), 5000).faultCode == F_NONE);
+  assert(artifacts.acceptPose(pose(10, 20), 5000));
+  assert(!artifacts.acceptPose(pose(10, 20), 5016));           // duplicate sequence
+  assert(artifacts.lastPoseRejectFault() == F_NONE);
+  assert(!artifacts.acceptPose(pose(9, 20), 5016));            // regression
+  assert(artifacts.lastPoseRejectFault() == F_NONE);
+  assert(!artifacts.acceptPose(pose(11, 20), 5000));           // same-tick pair
+  assert(artifacts.lastPoseRejectFault() == F_NONE);
+  assert(!artifacts.acceptPose(pose(12, 251), 5030));          // stale age
+  assert(artifacts.lastPoseRejectFault() == F_NONE);
+  assert(artifacts.acceptPose(pose(13, 20), 5032));            // stream continues
+  assert(artifacts.poseFresh(5032));
+
+  // Jump gates divide by capture spacing, not arrival spacing: coalescing can
+  // deliver poses captured a frame apart within a couple of milliseconds, and
+  // arrival-time dt turned a creeping rover's first real speed change into an
+  // impossible-acceleration F_POSE_JUMP.
+  MissionProtocol coalesced;
+  assert(coalesced.acceptCalibration(calibration(), 6000).faultCode == F_NONE);
+  PoseV2 slow = pose(20, 120);                 // captured at 5880
+  assert(coalesced.acceptPose(slow, 6000));
+  PoseV2 burst = pose(21, 20);                 // captured at 5982, arrives 2 ms later
+  burst.speedFps = 0.9f;                       // 8.8 fps^2 over capture time
+  assert(coalesced.acceptPose(burst, 6002));   // arrival-dt math would read 450 fps^2
+  PoseV2 teleport = pose(22, 20);              // captured at 6080
+  teleport.speedFps = 6.0f;                    // 52 fps^2 over capture time
+  assert(!coalesced.acceptPose(teleport, 6100));
+  assert(coalesced.lastPoseRejectFault() == F_POSE_JUMP);
 
   protocol.onDisconnect();
   assert(protocol.state() == S_FAULT && protocol.fault() == F_BLE);

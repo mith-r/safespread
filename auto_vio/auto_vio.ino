@@ -1496,9 +1496,12 @@ void feed(const uint8_t *d, size_t n, uint32_t receivedAtMs) {
         }
       } else if (!mission.acceptPose(pose, receivedAtMs)) {
         invalidPacketCount++;
-        if (mission.state() == S_ARMED || mission.state() == S_RUNNING) {
-          FaultCode fault = mission.lastPoseRejectFault();
-          enterFault(fault == F_NONE ? F_POSE_INVALID : fault);
+        // A rejection with no fault code is a benign transport artifact
+        // (duplicate, same-tick, or stale packet) -- dropped, not fatal.
+        FaultCode fault = mission.lastPoseRejectFault();
+        if (fault != F_NONE &&
+            (mission.state() == S_ARMED || mission.state() == S_RUNNING)) {
+          enterFault(fault);
         }
       }
       return;

@@ -1,5 +1,10 @@
 # Reliable Pavement VIO Control — Design Spec
 
+> **Historical only.** This specification contains retired product behavior
+> and must not be used as deployment source. The canonical app on `main`
+> accepts entered rectangle dimensions only; do not restore Walk corners or
+> Corner A/B capture.
+
 Date: 2026-08-26
 
 ## Problem

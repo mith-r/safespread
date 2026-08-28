@@ -74,6 +74,15 @@ class MissionProtocol {
     rectangle_ = message;
     hasRectangle_ = true;
     state_ = S_CONFIGURED;
+    // The rectangle defines the coordinate frame poses arrive in: the app
+    // streams the rover's raw world pose until it is configured, then switches
+    // to rectangle-relative coordinates. Discard the pre-rectangle pose so that
+    // one-time frame shift is not read as a position/heading jump -- exactly as
+    // acceptCalibration clears it when the epoch's frame of reference changes.
+    hasPose_ = false;
+    posePending_ = false;
+    lastPoseSequence_ = 0;
+    droppedPoses_ = 0;
     protocol_v2::AckV2 result = ack(message.epoch, message.commandId, F_NONE);
     cacheSetup(0x44, message.epoch, message.commandId, result);
     return result;
@@ -100,18 +109,35 @@ class MissionProtocol {
     }
     if ((message.flags & 0x01) == 0) return rejectPose(F_TRACKING_ERROR);
     if ((message.flags & 0x04) == 0) return rejectPose(F_CALIBRATION);
+    // Transport artifacts, not stream corruption: iOS coalesces BLE writes,
+    // so a duplicate, out-of-order, or same-millisecond packet arrives in
+    // normal operation, and a pose can sit in the app's queue past its age
+    // budget. Drop these without a fault -- freshness is enforced separately
+    // (poseFresh watchdog faults with F_POSE_TIMEOUT if nothing usable
+    // arrives) -- so one coalesced packet cannot kill an armed mission.
     if (message.ageMs > MAX_POSE_AGE_MS ||
         (hasPose_ && message.sequence <= lastPoseSequence_)) {
-      return rejectPose(F_POSE_INVALID);
+      return rejectPoseBenign();
     }
     if (std::fabs(message.speedFps) > MAX_SPEED_FPS ||
         std::fabs(message.yawRateDps) > MAX_YAW_RATE_DPS) {
       return rejectPose(F_POSE_INVALID);
     }
     if (hasPose_) {
-      const float dt = (receivedAtMs - poseReceivedAtMs_) / 1000.0f;
-      if (dt <= 0.0f) return rejectPose(F_POSE_INVALID);
-      if (std::fabs(message.speedFps - latestPose_.speedFps) / dt > MAX_ACCEL_FPS2) {
+      // The jump gates bound how far the pose may move between camera
+      // captures, so dt must be capture-to-capture time. Arrival spacing is
+      // wrong for that: iOS coalesces BLE writes, so poses captured ~100 ms
+      // apart routinely land ~2 ms apart, which explodes the acceleration
+      // ratio and collapses the distance/heading envelopes (seen in the field
+      // as F_POSE_JUMP the moment the rover starts creeping). Reconstruct the
+      // capture instant from the packet's own age.
+      const int64_t captureMs = (int64_t)receivedAtMs - (int64_t)message.ageMs;
+      const float dt = (captureMs - lastCaptureMs_) / 1000.0f;
+      if (dt <= 0.0f) return rejectPoseBenign();  // coalesced or duplicate frame
+      // Transit jitter (~10 ms) corrupts short intervals, so evaluate the
+      // acceleration ratio over at least 50 ms of capture time.
+      const float accelDt = std::fmax(dt, 0.05f);
+      if (std::fabs(message.speedFps - latestPose_.speedFps) / accelDt > MAX_ACCEL_FPS2) {
         return rejectPose(F_POSE_JUMP);
       }
       const float dx = message.x - latestPose_.x;
@@ -133,6 +159,7 @@ class MissionProtocol {
     latestPose_ = message;
     lastPoseSequence_ = message.sequence;
     poseReceivedAtMs_ = receivedAtMs;
+    lastCaptureMs_ = (int64_t)receivedAtMs - (int64_t)message.ageMs;
     hasPose_ = true;
     posePending_ = true;
     return true;
@@ -288,6 +315,7 @@ class MissionProtocol {
   protocol_v2::PoseV2 latestPose_ = {};
   uint32_t lastPoseSequence_ = 0;
   uint32_t poseReceivedAtMs_ = 0;
+  int64_t lastCaptureMs_ = 0;
   uint32_t droppedPoses_ = 0;
   FaultCode lastPoseRejectFault_ = F_NONE;
   bool lastCommandWasDuplicate_ = false;
@@ -315,6 +343,13 @@ class MissionProtocol {
 
   bool rejectPose(FaultCode fault) {
     lastPoseRejectFault_ = fault;
+    return false;
+  }
+
+  /** Drop the packet without blaming the stream: lastPoseRejectFault stays
+   *  F_NONE so the caller does not escalate to a mission fault. */
+  bool rejectPoseBenign() {
+    lastPoseRejectFault_ = F_NONE;
     return false;
   }
 

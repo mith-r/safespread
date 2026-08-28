@@ -68,12 +68,14 @@ reliability. Run the stages in order and stop at the first failed gate.
 Confirm all of the following on the setup wizard:
 
 - Connected firmware advertises protocol v2 and acknowledges configuration.
-- Entered M×N or walked opposite corners are confirmed, including left/right
-  coverage side. For walked mode, Corner A was captured while the phone top
-  pointed along M.
-- Entered start and far-end clearances are inside the coned site. Configure/Arm
-  must be acknowledged without `F_HEADLAND`; the exported firmware log records
-  the planned route style and its calculated clearance requirement.
+- Entered M×N dimensions are confirmed, including the left/right coverage
+  side. The retired walked-corner workflow must not appear.
+- The clear pavement the app shows behind A and beyond the far M edge (worked
+  out from the planned three-point headland turns, about 7 ft at each end for
+  the measured radii; there is no operator entry) is inside the coned site. After Configure the rover reports the clearance its own route
+  needs; the readiness card shows it as rover-confirmed and warns if it exceeds
+  the preview. The exported firmware log records the planned route style and
+  its calculated clearance requirement.
 - The mount/steering/speed calibration identity is current for this hardware.
 - Tracking is `normal`, the pose is stable for at least two seconds/30 samples,
   the newest pose is fresh, and the readiness checklist is fully green.
@@ -154,8 +156,8 @@ Confirm all of the following on the setup wizard:
 
 ### 5. Repeated one-pass dry runs in both directions
 
-- Mark one straight M line at least 20 feet long, with the entered and coned clear
-  pavement at each end. Enter N no wider than one spray pass. Keep spray off.
+- Mark one straight M line at least 20 feet long, with the app-shown clear
+  pavement coned at each end. Enter N no wider than one spray pass. Keep spray off.
 - Run three passes in +M and three in -M, starting physically centered and
   aligned each time. Speed is not selectable: the loop holds the 1.5 ft/s
   straight target.
@@ -176,10 +178,10 @@ Confirm all of the following on the setup wizard:
 
 ### 7. Direction changes and lane entry, spray disabled
 
-- The current app always requests forward-only preference; there is no manual
-  route-style selector. Firmware automatically falls back to a three-point
-  route only when forward-only does not fit the entered clearance and the
-  three-point route does. Do not claim or search for a UI selector.
+- The current app requests car-style three-point headland turns (no
+  forward-only preference); there is no manual route-style selector. Configure
+  tells the firmware the pavement is unbounded, so it plans that route and
+  reports the clearance it needs. Do not claim or search for a UI selector.
 - First use `Verify reverse` and the dry self-test to exercise five verified
   forward/reverse engagements. For autonomous lane entry, cone the entered
   headlands and run at least five entries at each end on the route firmware
@@ -196,15 +198,15 @@ Confirm all of the following on the setup wizard:
   jump, or need for more clearance than Configure accepted/the firmware log
   reported.
 
-### 8. Complete dry rectangle in both definition modes
+### 8. Complete dry rectangles on both coverage sides
 
-- Keep spray off. Run one small complete dry rectangle using entered M×N and a
-  second using walked opposite corners. Across the two, exercise both left and
-  right coverage-side confirmation. Repeat each mode once after removing and
-  re-seating the phone mount.
+- Keep spray off. Run one small complete dry rectangle with right-side coverage
+  and a second with left-side coverage, using entered M×N dimensions for both.
+  Repeat each side once after removing and re-seating the phone mount.
 - Pass all four missions: route finishes without fault or skipped leg; every
   sprayed-designated pass meets the Stage 5 limits; actual path stays inside
-  the confirmed rectangle plus entered headlands; replay accepts each log.
+  the confirmed rectangle plus the rover-reported headlands; replay accepts each
+  log.
 - Review all Stage 1–8 JSONL/CSV logs together before authorizing Stage 9.
 
 ### 9. Low-speed wet rectangle after log review
@@ -217,9 +219,9 @@ Confirm all of the following on the setup wizard:
   there is no slower setting to fall back on -- if wet traction will not hold
   that speed, stop rather than looking for one. First validate with water when
   conditions permit; then use brine. Keep the operator ready on Stop throughout.
-- Run one entered and one walked-corner rectangle. Inspect traction, stopping
-  distance, line error, overlap, application consistency, and all exported logs
-  after each run.
+- Run one rectangle on each coverage side using entered dimensions. Inspect
+  traction, stopping distance, line error, overlap, application consistency,
+  and all exported logs after each run.
 - Pass only if both wet runs meet every dry numerical limit with no slip or
   increased stopping envelope. Otherwise Stop, return to dry diagnostics, and
   do not use autonomous wet spreading.

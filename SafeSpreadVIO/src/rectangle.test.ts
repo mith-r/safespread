@@ -1,10 +1,10 @@
 import {
-  captureCornerA,
   defineEnteredRectangle,
-  defineWalkedRectangle,
   rectangleToWorld,
+  withRoverHeadland,
   worldToRectangle,
 } from './rectangle';
+import { estimateHeadland } from './routePlan';
 import { Pose } from './poseMath';
 
 function expectPoseClose(actual: Pose, expected: Pose) {
@@ -16,23 +16,43 @@ function expectPoseClose(actual: Pose, expected: Pose) {
 describe('entered rectangle', () => {
   it.each(['right', 'left'] as const)('uses the stable rover pose and explicit %s side', (side) => {
     const origin = { x: 10, y: -4, heading: 37 };
-    const definition = defineEnteredRectangle(origin, 20, 8, side, 4, 6);
+    const definition = defineEnteredRectangle(origin, 20, 8, side);
+    const planned = estimateHeadland(20, 8);
+    expect(planned).not.toBeNull();
     expect(definition).toEqual({
       originWorld: origin,
       mAxisHeadingDeg: 37,
       mFt: 20,
       nFt: 8,
       side,
-      startClearFt: 4,
-      endClearFt: 6,
+      startClearFt: planned?.beforeStartFt,
+      endClearFt: planned?.beyondEndFt,
+      headlandSource: 'estimated',
       source: 'entered',
     });
     expectPoseClose(worldToRectangle(origin, definition), { x: 0, y: 0, heading: 0 });
   });
 
+  it('plans the measured pavement rectangle at the same headland the rover needs', () => {
+    const definition = defineEnteredRectangle({ x: 0, y: 0, heading: 0 }, 21.9, 21.9, 'right');
+    expect(definition.startClearFt).toBeCloseTo(6.83, 2);
+    expect(definition.endClearFt).toBeCloseTo(7.07, 2);
+    expect(definition.headlandSource).toBe('estimated');
+  });
+
+  it('defers to the rover when the route cannot be planned within the point limit', () => {
+    const definition = defineEnteredRectangle({ x: 0, y: 0, heading: 0 }, 300, 120, 'right');
+    expect(definition).toMatchObject({ startClearFt: 0, endClearFt: 0, headlandSource: 'unknown' });
+  });
+
+  it('rejects non-positive dimensions', () => {
+    expect(() => defineEnteredRectangle({ x: 0, y: 0, heading: 0 }, 0, 8, 'right')).toThrow('M');
+    expect(() => defineEnteredRectangle({ x: 0, y: 0, heading: 0 }, 8, -1, 'right')).toThrow('N');
+  });
+
   it('round trips an arbitrary world heading for either coverage side', () => {
     for (const side of ['right', 'left'] as const) {
-      const definition = defineEnteredRectangle({ x: 3, y: 8, heading: 123 }, 12, 5, side, 2, 3);
+      const definition = defineEnteredRectangle({ x: 3, y: 8, heading: 123 }, 12, 5, side);
       const rectanglePose = { x: 2.5, y: 7.25, heading: 81 };
       expectPoseClose(
         worldToRectangle(rectangleToWorld(rectanglePose, definition), definition),
@@ -42,53 +62,18 @@ describe('entered rectangle', () => {
   });
 });
 
-describe('walked opposite-corner rectangle', () => {
-  it('projects B onto A forward/right axes when A points north', () => {
-    const a = captureCornerA({ x: 0, y: 0, heading: 0 }, true);
-    const definition = defineWalkedRectangle(a, { x: 4, y: 10, heading: 0 }, 3, 5, true);
-    expect(definition).toMatchObject({
-      mAxisHeadingDeg: 0,
-      mFt: 10,
-      nFt: 4,
-      side: 'right',
-      source: 'walked',
-    });
+describe('withRoverHeadland', () => {
+  it('replaces the estimate with the rover-reported requirement', () => {
+    const definition = defineEnteredRectangle({ x: 0, y: 0, heading: 0 }, 21.9, 21.9, 'right');
+    const confirmed = withRoverHeadland(definition, { beforeStartFt: 19, beyondEndFt: 12 });
+    expect(confirmed).toMatchObject({ startClearFt: 19, endClearFt: 12, headlandSource: 'rover' });
+    expect(confirmed.mFt).toBe(definition.mFt);
+    expect(definition.headlandSource).toBe('estimated');
   });
 
-  it('uses A heading at 90 degrees and reports a deliberate left side', () => {
-    const a = captureCornerA({ x: 2, y: 3, heading: 90 }, true);
-    const right = defineWalkedRectangle(a, { x: 12, y: -1, heading: 12 }, 0, 0, true);
-    expect(right.mFt).toBeCloseTo(10);
-    expect(right.nFt).toBeCloseTo(4);
-    expect(right.side).toBe('right');
-
-    const left = defineWalkedRectangle(a, { x: 12, y: 7, heading: 12 }, 0, 0, true);
-    expect(left.mFt).toBeCloseTo(10);
-    expect(left.nFt).toBeCloseTo(4);
-    expect(left.side).toBe('left');
-  });
-
-  it('rejects unstable captures and degenerate diagonals/projections', () => {
-    expect(() => captureCornerA({ x: 0, y: 0, heading: 0 }, false)).toThrow('stable');
-    const a = captureCornerA({ x: 0, y: 0, heading: 0 }, true);
-    expect(() => defineWalkedRectangle(a, { x: 1, y: 1, heading: 0 }, 0, 0, true)).toThrow(
-      'diagonal',
-    );
-    expect(() => defineWalkedRectangle(a, { x: 3, y: 0.5, heading: 0 }, 0, 0, true)).toThrow(
-      'forward',
-    );
-    expect(() => defineWalkedRectangle(a, { x: 0.5, y: 3, heading: 0 }, 0, 0, true)).toThrow(
-      'lateral',
-    );
-    expect(() => defineWalkedRectangle(a, { x: 3, y: 3, heading: 0 }, 0, 0, false)).toThrow(
-      'stable',
-    );
-  });
-
-  it('does not silently accept B behind the direction indicated at A', () => {
-    const a = captureCornerA({ x: 0, y: 0, heading: 0 }, true);
-    expect(() => defineWalkedRectangle(a, { x: 4, y: -10, heading: 0 }, 0, 0, true)).toThrow(
-      'ahead',
-    );
+  it('rejects malformed rover figures', () => {
+    const definition = defineEnteredRectangle({ x: 0, y: 0, heading: 0 }, 21.9, 21.9, 'right');
+    expect(() => withRoverHeadland(definition, { beforeStartFt: -1, beyondEndFt: 2 })).toThrow(RangeError);
+    expect(() => withRoverHeadland(definition, { beforeStartFt: Number.NaN, beyondEndFt: 2 })).toThrow(RangeError);
   });
 });

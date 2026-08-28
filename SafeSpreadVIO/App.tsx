@@ -20,6 +20,7 @@ import { MAX_PATH_POINTS, PathPoint, shouldRecord } from './src/pathMath';
 import { wrappedHeadingDelta } from './src/poseMath';
 import { buildPoseV2, FaultSampleV2, TelemetryV2 } from './src/protocolV2';
 import { worldToRectangle } from './src/rectangle';
+import { parseRoverHeadlandLog } from './src/routePlan';
 import RunningMission from './src/RunningMission';
 import SetupWizard, { CalibrationFormValue } from './src/SetupWizard';
 import {
@@ -247,7 +248,8 @@ export default function App() {
     }
     const control = new MissionControl(ble, epoch, () => trackingOkRef.current, {
       dryMode: !setup.wet,
-      preferForwardOnly: true,
+      // Three-point turns: the headland shown in the preview assumes them.
+      preferForwardOnly: false,
     });
     const sender = new LatestPoseSender(ble, (error) => {
       void handleMissionFault(`pose transport failed: ${error.message}`);
@@ -424,6 +426,8 @@ export default function App() {
             else waiter.resolve(line);
           }
         }
+        const roverHeadland = parseRoverHeadlandLog(line);
+        if (roverHeadland) dispatch({ type: 'ROVER_HEADLAND', ...roverHeadland });
         if (line.startsWith('=== SELF TEST')) {
           setCalibrationProgress(line);
           const waiter = selfTestWaiterRef.current;
@@ -555,7 +559,13 @@ export default function App() {
         condition: setup.wet ? 'wet' : 'dry',
       });
       await saveCalibration(record, HARDWARE_TAG);
+      const previous = calibration;
       setCalibration(record);
+      const mountChanged = !previous ||
+        previous.cameraForwardFt !== record.cameraForwardFt ||
+        previous.cameraRightFt !== record.cameraRightFt ||
+        previous.cameraYawDeg !== record.cameraYawDeg;
+      if (mountChanged) dispatch({ type: 'MOUNT_CALIBRATION_CHANGED' });
       dispatch({ type: 'SET_CALIBRATION_STATUS', status: 'ready' });
       setCalibrationProgress(`Phone calibration ${record.id} saved. Run dry steering, speed, and reverse checks for this ID.`);
     } catch (error) {
@@ -679,9 +689,25 @@ export default function App() {
       dispatch({ type: 'REQUEST_ARM' });
       if (!setup.rectangle) throw new Error('Rectangle is missing.');
       const wire = calibration ?? DEFAULT_MOUNT_CALIBRATION;
+      // Configure switches the pose stream from world to rectangle-relative
+      // coordinates and the rover discards its pose baseline when it accepts
+      // the rectangle. Pause the stream across the exchange so no world-frame
+      // pose lands after that reset: a single straggler would re-baseline the
+      // rover in world coordinates and the first rectangle-frame pose would
+      // read as a physically impossible jump (F_POSE_JUMP) the moment it arms.
+      poseStreamingRef.current = false;
       await control.configure(setup.rectangle, wire);
       operationGateRef.current.assertCurrent(operation.generation);
       rectangleConfiguredRef.current = true;
+      const resumeSequence = lastPoseOfferedSequenceRef.current;
+      poseStreamingRef.current = true;
+      // Arm requires a freshly accepted pose, so wait until rectangle-frame
+      // poses are flowing again before asking.
+      const poseDeadline = Date.now() + 1000;
+      while (lastPoseOfferedSequenceRef.current < resumeSequence + 2 && Date.now() < poseDeadline) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        operationGateRef.current.assertCurrent(operation.generation);
+      }
       const currentReadiness = setupRef.current.readiness;
       if (!trackingOkRef.current || !currentReadiness.poseStable || !currentReadiness.atStart) {
         throw new Error('Readiness changed during Configure; Stop and return to the rectangle start.');
@@ -794,7 +820,6 @@ export default function App() {
     <SetupWizard
       state={setup}
       roverPose={vio.pose}
-      cameraPose={vio.validatedPose?.camera ?? null}
       trackingDetail={trackingDetail}
       readinessReason={vio.readiness.reason}
       calibration={calibration}

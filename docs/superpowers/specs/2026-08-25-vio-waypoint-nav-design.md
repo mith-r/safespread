@@ -1,5 +1,9 @@
 # Phone-VIO Waypoint Navigation — Design Spec
 
+> **Historical only.** This specification is not a current product requirement
+> and must not be used as deployment source. Follow the canonical app on
+> `main`, which does not include a walked-corner setup workflow.
+
 Date: 2026-08-25
 
 ## Problem

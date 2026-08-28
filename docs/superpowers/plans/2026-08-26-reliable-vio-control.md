@@ -1,5 +1,9 @@
 # Reliable Pavement VIO Control Implementation Plan
 
+> **Historical only.** This plan describes retired product behavior and must
+> not be used as deployment source. The canonical app on `main` accepts entered
+> rectangle dimensions only; do not restore Walk corners or Corner A/B capture.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make SafeSpread define either an entered or walked-corner pavement rectangle, follow it from fresh calibrated iPhone poses, log every mission, and fail safely when sensing, transport, power, or motion becomes untrustworthy.

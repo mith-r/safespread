@@ -15,6 +15,12 @@ export const SAFESPREAD_HARDWARE_GEOMETRY = Object.freeze({
   wheelbaseFt: 13.5 / 12,
   frontTrackFt: 19.5 / 30.48,
   rearTrackFt: 19.5 / 30.48,
+  // Full-lock turning radii measured with turn_radius/turn_radius.ino. They
+  // are not the same size because the steering trim sits off-centre. These
+  // mirror the firmware defaults (auto_vio.ino); the rover replaces them with
+  // its stored steering calibration when it plans, and reports what it needs.
+  turnRadiusLeftFt: 4.33,
+  turnRadiusRightFt: 2.92,
 });
 
 export const DEFAULT_MOUNT_CALIBRATION: MountCalibration = {

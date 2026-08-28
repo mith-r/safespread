@@ -1,6 +1,12 @@
 import { normalizeHeading, Pose } from './poseMath';
+import { estimateHeadland, HeadlandRequirement } from './routePlan';
 
 export type CoverageSide = 'right' | 'left';
+
+/** Where the headland figures came from: the app's planner estimate, the
+ *  rover's own plan after Configure, or nowhere yet because the route could
+ *  not be planned within the firmware's point limit and the rover decides. */
+export type HeadlandSource = 'estimated' | 'rover' | 'unknown';
 
 export interface RectangleDefinition {
   originWorld: Pose;
@@ -8,14 +14,12 @@ export interface RectangleDefinition {
   mFt: number;
   nFt: number;
   side: CoverageSide;
+  /** Clear pavement the planned turns need behind A, in feet. */
   startClearFt: number;
+  /** Clear pavement the planned turns need beyond the far M edge, in feet. */
   endClearFt: number;
-  source: 'entered' | 'walked';
-}
-
-export interface CornerA {
-  poseWorld: Pose;
-  mAxisHeadingDeg: number;
+  headlandSource: HeadlandSource;
+  source: 'entered';
 }
 
 function requirePose(pose: Pose, name: string): Pose {
@@ -30,9 +34,35 @@ function requirePositive(value: number, name: string): number {
   return value;
 }
 
-function requireClearance(value: number, name: string): number {
-  if (!Number.isFinite(value) || value < 0) throw new RangeError(`${name} must not be negative`);
-  return value;
+type PlannedHeadland = Pick<RectangleDefinition, 'startClearFt' | 'endClearFt' | 'headlandSource'>;
+
+/** The minimum headland the planned route (car-style three-point turns)
+ *  needs for this rectangle. The rover always runs at its own computed
+ *  minimum; this is what the operator sees before arming. */
+function plannedHeadland(mFt: number, nFt: number): PlannedHeadland {
+  const estimate = estimateHeadland(mFt, nFt);
+  if (!estimate) return { startClearFt: 0, endClearFt: 0, headlandSource: 'unknown' };
+  return {
+    startClearFt: estimate.beforeStartFt,
+    endClearFt: estimate.beyondEndFt,
+    headlandSource: 'estimated',
+  };
+}
+
+/** Replace the estimate with what the rover reported after planning. */
+export function withRoverHeadland(
+  definition: RectangleDefinition,
+  requirement: HeadlandRequirement,
+): RectangleDefinition {
+  if (![requirement.beforeStartFt, requirement.beyondEndFt].every((v) => Number.isFinite(v) && v >= 0)) {
+    throw new RangeError('rover headland must be finite and non-negative');
+  }
+  return {
+    ...definition,
+    startClearFt: requirement.beforeStartFt,
+    endClearFt: requirement.beyondEndFt,
+    headlandSource: 'rover',
+  };
 }
 
 function worldDeltaToAxes(dx: number, dy: number, headingDeg: number) {
@@ -56,56 +86,19 @@ export function defineEnteredRectangle(
   mFt: number,
   nFt: number,
   side: CoverageSide,
-  startClearFt: number,
-  endClearFt: number,
 ): RectangleDefinition {
   const originWorld = requirePose(stableRover, 'rover');
   if (side !== 'right' && side !== 'left') throw new RangeError('coverage side is invalid');
+  const m = requirePositive(mFt, 'M');
+  const n = requirePositive(nFt, 'N');
   return {
     originWorld,
     mAxisHeadingDeg: originWorld.heading,
-    mFt: requirePositive(mFt, 'M'),
-    nFt: requirePositive(nFt, 'N'),
+    mFt: m,
+    nFt: n,
     side,
-    startClearFt: requireClearance(startClearFt, 'start clearance'),
-    endClearFt: requireClearance(endClearFt, 'end clearance'),
+    ...plannedHeadland(m, n),
     source: 'entered',
-  };
-}
-
-export function captureCornerA(stableCamera: Pose, isStable: boolean): CornerA {
-  if (!isStable) throw new Error('Corner A requires a stable normal pose');
-  const poseWorld = requirePose(stableCamera, 'Corner A');
-  return { poseWorld, mAxisHeadingDeg: poseWorld.heading };
-}
-
-export function defineWalkedRectangle(
-  a: CornerA,
-  bWorld: Pose,
-  startClearFt: number,
-  endClearFt: number,
-  isBStable: boolean,
-): RectangleDefinition {
-  if (!isBStable) throw new Error('Corner B requires a stable normal pose');
-  const aPose = requirePose(a.poseWorld, 'Corner A');
-  const bPose = requirePose(bWorld, 'Corner B');
-  const heading = normalizeHeading(a.mAxisHeadingDeg);
-  const dx = bPose.x - aPose.x;
-  const dy = bPose.y - aPose.y;
-  if (Math.hypot(dx, dy) < 3) throw new RangeError('corner diagonal must be at least 3 ft');
-  const projected = worldDeltaToAxes(dx, dy, heading);
-  if (projected.forward < 0) throw new RangeError('Corner B must be ahead of Corner A');
-  if (projected.forward < 1) throw new RangeError('forward projection must be at least 1 ft');
-  if (Math.abs(projected.right) < 1) throw new RangeError('lateral projection must be at least 1 ft');
-  return {
-    originWorld: { ...aPose, heading },
-    mAxisHeadingDeg: heading,
-    mFt: projected.forward,
-    nFt: Math.abs(projected.right),
-    side: projected.right < 0 ? 'left' : 'right',
-    startClearFt: requireClearance(startClearFt, 'start clearance'),
-    endClearFt: requireClearance(endClearFt, 'end clearance'),
-    source: 'walked',
   };
 }
 

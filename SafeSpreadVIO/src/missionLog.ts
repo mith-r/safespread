@@ -23,7 +23,7 @@ export interface MissionMetadata {
   // epoch but no rectangle, and requiring one here is what kept it from running
   // on a rover that could not be set up in the first place.
   rectangle?: {
-    source: 'entered' | 'walked';
+    source: 'entered';
     mFt: number;
     nFt: number;
     side: 'right' | 'left';

@@ -1,19 +1,20 @@
 import { ConnectionStatus } from './ble';
 import { FaultSampleV2, parseFaultSampleV2 } from './protocolV2';
 import {
-  captureCornerA,
-  CornerA,
   CoverageSide,
   defineEnteredRectangle,
-  defineWalkedRectangle,
   RectangleDefinition,
+  withRoverHeadland,
 } from './rectangle';
 import { Pose } from './poseMath';
+
+/** How much more than the preview estimate the rover may ask for before the
+ *  operator is told to re-check the coned area. */
+export const ROVER_HEADLAND_WARN_FT = 0.25;
 
 export type SetupPhase =
   | 'connection'
   | 'rectangle'
-  | 'calibration'
   | 'readiness'
   | 'arming'
   | 'armed'
@@ -22,7 +23,6 @@ export type SetupPhase =
   | 'complete'
   | 'fault';
 
-export type RectangleMode = 'entered' | 'walked';
 export type CalibrationStatus = 'missing' | 'stale' | 'ready';
 
 export interface SetupReadiness {
@@ -35,9 +35,7 @@ export interface SetupState {
   phase: SetupPhase;
   connectionStatus: ConnectionStatus;
   compatible: boolean;
-  rectangleMode: RectangleMode | null;
   rectangle: RectangleDefinition | null;
-  cornerA: CornerA | null;
   coverageSideConfirmed: boolean;
   calibrationStatus: CalibrationStatus;
   wet: boolean;
@@ -50,25 +48,19 @@ export interface SetupState {
 
 export type SetupAction =
   | { type: 'CONNECTION_CHANGED'; status: ConnectionStatus; compatible: boolean }
-  | { type: 'SELECT_RECTANGLE_MODE'; mode: RectangleMode }
   | {
       type: 'SET_ENTERED_RECTANGLE';
       pose: Pose;
       mFt: number;
       nFt: number;
       side: CoverageSide;
-      startClearFt: number;
-      endClearFt: number;
-    }
-  | { type: 'CAPTURE_CORNER_A'; pose: Pose; stable: boolean }
-  | {
-      type: 'CAPTURE_CORNER_B';
-      pose: Pose;
-      stable: boolean;
-      startClearFt: number;
-      endClearFt: number;
     }
   | { type: 'CONFIRM_COVERAGE_SIDE' }
+  /** The camera-mount numbers changed, so poses now come through a different
+   *  transform and any stored rectangle origin no longer matches. */
+  | { type: 'MOUNT_CALIBRATION_CHANGED' }
+  /** The rover's own headland requirement, logged after it plans the route. */
+  | { type: 'ROVER_HEADLAND'; beforeStartFt: number; beyondEndFt: number }
   | { type: 'SET_CALIBRATION_STATUS'; status: CalibrationStatus }
   | { type: 'SET_WET_MODE'; wet: boolean }
   | { type: 'SET_LOGGING_READY'; ready: boolean }
@@ -119,9 +111,7 @@ export function initialSetupState(): SetupState {
     phase: 'connection',
     connectionStatus: 'disconnected',
     compatible: false,
-    rectangleMode: null,
     rectangle: null,
-    cornerA: null,
     coverageSideConfirmed: false,
     calibrationStatus: 'missing',
     wet: false,
@@ -154,9 +144,7 @@ function canArm(state: SetupState): string | null {
   if (!state.readiness.trackingNormal) return 'ARKit tracking must be normal before arming.';
   if (!state.readiness.poseStable) return 'Wait for a stable pose before arming.';
   if (!state.readiness.atStart) {
-    return state.rectangleMode === 'walked'
-      ? 'Return the rover to Corner A before arming.'
-      : 'Move the rover to the rectangle start before arming.';
+    return 'Move the rover to the rectangle start before arming.';
   }
   if (state.wet && state.calibrationStatus !== 'ready') {
     return 'Wet operation requires a current matching calibration.';
@@ -179,71 +167,15 @@ export function setupReducer(state: SetupState, action: SetupAction): SetupState
         validationError: null,
       };
 
-    case 'SELECT_RECTANGLE_MODE':
-      if (state.phase !== 'rectangle') return fail(state, 'Rectangle mode can only change during setup.');
-      return {
-        ...state,
-        rectangleMode: action.mode,
-        rectangle: null,
-        cornerA: null,
-        coverageSideConfirmed: false,
-        validationError: null,
-      };
-
     case 'SET_ENTERED_RECTANGLE':
-      if (state.phase !== 'rectangle' || state.rectangleMode !== 'entered') {
-        return fail(state, 'Select entered-dimensions mode first.');
+      if (state.phase !== 'rectangle') {
+        return fail(state, 'Define the rectangle during setup.');
       }
       try {
         return {
           ...state,
-          rectangle: defineEnteredRectangle(
-            action.pose,
-            action.mFt,
-            action.nFt,
-            action.side,
-            action.startClearFt,
-            action.endClearFt,
-          ),
+          rectangle: defineEnteredRectangle(action.pose, action.mFt, action.nFt, action.side),
           coverageSideConfirmed: action.side === 'right',
-          validationError: null,
-        };
-      } catch (error) {
-        return fail(state, error instanceof Error ? error.message : String(error));
-      }
-
-    case 'CAPTURE_CORNER_A':
-      if (state.phase !== 'rectangle' || state.rectangleMode !== 'walked') {
-        return fail(state, 'Select walked-corners mode first.');
-      }
-      try {
-        return {
-          ...state,
-          cornerA: captureCornerA(action.pose, action.stable),
-          rectangle: null,
-          coverageSideConfirmed: false,
-          validationError: null,
-        };
-      } catch (error) {
-        return fail(state, error instanceof Error ? error.message : String(error));
-      }
-
-    case 'CAPTURE_CORNER_B':
-      if (state.phase !== 'rectangle' || state.rectangleMode !== 'walked' || !state.cornerA) {
-        return fail(state, 'Capture stable Corner A before Corner B.');
-      }
-      try {
-        const rectangle = defineWalkedRectangle(
-          state.cornerA,
-          action.pose,
-          action.startClearFt,
-          action.endClearFt,
-          action.stable,
-        );
-        return {
-          ...state,
-          rectangle,
-          coverageSideConfirmed: rectangle.side === 'right',
           validationError: null,
         };
       } catch (error) {
@@ -253,6 +185,46 @@ export function setupReducer(state: SetupState, action: SetupAction): SetupState
     case 'CONFIRM_COVERAGE_SIDE':
       if (!state.rectangle) return fail(state, 'Define the rectangle before confirming its side.');
       return { ...state, coverageSideConfirmed: true, validationError: null };
+
+    case 'MOUNT_CALIBRATION_CHANGED':
+      // The rectangle origin was captured through the old mount transform;
+      // with new numbers the computed rover pose shifts, so "at start" would
+      // silently disagree with the stored origin (seen in the field as a
+      // spurious "move the rover to the rectangle start"). Re-set it.
+      if (!state.rectangle || !['rectangle', 'readiness'].includes(state.phase)) return state;
+      return {
+        ...state,
+        phase: 'rectangle',
+        rectangle: null,
+        coverageSideConfirmed: false,
+        warning: 'Mount calibration changed — set the rectangle again so its origin uses the new numbers.',
+        validationError: null,
+      };
+
+    case 'ROVER_HEADLAND': {
+      // A stray line with no rectangle in play carries nothing to update.
+      if (!state.rectangle) return state;
+      let rectangle: RectangleDefinition;
+      try {
+        rectangle = withRoverHeadland(state.rectangle, action);
+      } catch (error) {
+        return fail(state, error instanceof Error ? error.message : String(error));
+      }
+      const previous = state.rectangle;
+      const needsMore = previous.headlandSource === 'estimated' && (
+        action.beforeStartFt > previous.startClearFt + ROVER_HEADLAND_WARN_FT ||
+        action.beyondEndFt > previous.endClearFt + ROVER_HEADLAND_WARN_FT);
+      const headlandWarning = needsMore
+        ? `Rover needs ${action.beforeStartFt.toFixed(1)} ft behind A and ${action.beyondEndFt.toFixed(1)} ft beyond M — more than the preview estimated (${previous.startClearFt.toFixed(1)} / ${previous.endClearFt.toFixed(1)} ft). Re-check the clear pavement before Start.`
+        : null;
+      return {
+        ...state,
+        rectangle,
+        warning: headlandWarning && state.warning
+          ? `${state.warning} ${headlandWarning}`
+          : headlandWarning ?? state.warning,
+      };
+    }
 
     case 'SET_CALIBRATION_STATUS':
       return { ...state, calibrationStatus: action.status, validationError: null };
@@ -285,12 +257,10 @@ export function setupReducer(state: SetupState, action: SetupAction): SetupState
         if (state.rectangle.side === 'left' && !state.coverageSideConfirmed) {
           return fail(state, 'Left coverage side must be explicitly confirmed.');
         }
-        return { ...state, phase: 'calibration', validationError: null };
-      }
-      if (state.phase === 'calibration') {
-        if (state.wet && state.calibrationStatus !== 'ready') {
-          return fail(state, 'Wet operation requires a current matching calibration.');
-        }
+        // Calibration is no longer a forced step: the stored mount/pavement
+        // calibration carries between runs and is exercised from the
+        // Diagnostics panel only when something changes. Wet operation still
+        // requires a current calibration, enforced at Arm (see canArm).
         return { ...state, phase: 'readiness', validationError: null };
       }
       return fail(state, 'Continue is not available in the current phase.');
