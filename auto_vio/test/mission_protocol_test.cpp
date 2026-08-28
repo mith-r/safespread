@@ -90,12 +90,12 @@ int main() {
   assert(!protocol.acceptPose(tooFast, 1030));
   PoseV2 jumped = pose(7);
   jumped.x = 2.0f;
-  assert(!protocol.acceptPose(jumped, 1030));
-  assert(protocol.lastPoseRejectFault() == F_POSE_JUMP);
+  assert(protocol.acceptPose(jumped, 1030));
+  assert(protocol.lastPoseRejectFault() == F_NONE);
   PoseV2 headingJump = pose(8);
   headingJump.heading = 20.0f;
-  assert(!protocol.acceptPose(headingJump, 1040));
-  assert(protocol.lastPoseRejectFault() == F_POSE_JUMP);
+  assert(protocol.acceptPose(headingJump, 1040));
+  assert(protocol.lastPoseRejectFault() == F_NONE);
 
   // STOP is always accepted, including epoch zero used as the safe v2 probe.
   ack = protocol.acceptCommand({3, 0, 99}, 1020);
@@ -213,18 +213,17 @@ int main() {
   assert(resting.acceptPose(bunchedSecond, restingNow + 20));
   assert(resting.lastPoseRejectFault() == F_NONE);
 
-  // A genuine relocalisation snap is still a jump, and the freshness deadline
-  // is still a timeout.
+  // Genuine relocalisation snaps and velocity lurches remain usable poses.
   PoseV2 snap = pose(9002, 20);
   snap.x = 4.0f;
-  assert(!resting.acceptPose(snap, restingNow + 40));
-  assert(resting.lastPoseRejectFault() == F_POSE_JUMP);
+  assert(resting.acceptPose(snap, restingNow + 40));
+  assert(resting.lastPoseRejectFault() == F_NONE);
   PoseV2 lurch = pose(9003, 20);
   lurch.speedFps = 4.0f;
-  assert(!resting.acceptPose(lurch, restingNow + 60));
-  assert(resting.lastPoseRejectFault() == F_POSE_JUMP);
-  assert(resting.poseFresh(restingNow + 40));
-  assert(!resting.poseFresh(restingNow + 20 + 231));
+  assert(resting.acceptPose(lurch, restingNow + 60));
+  assert(resting.lastPoseRejectFault() == F_NONE);
+  assert(resting.poseFresh(restingNow + 60));
+  assert(!resting.poseFresh(restingNow + 60 + 231));
 
   std::printf("mission_protocol_test: all assertions passed\n");
   return 0;

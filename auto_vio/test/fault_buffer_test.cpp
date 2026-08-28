@@ -67,6 +67,13 @@ int main() {
   uint8_t tooSmall[8];
   assert(!buffer.buildPacket(4, 42, tooSmall, sizeof(tooSmall)));
 
+  buffer.reset();
+  assert(!buffer.frozen() && buffer.fault() == F_NONE && buffer.size() == 0);
+  buffer.push(sample(20));
+  assert(buffer.size() == 1 && buffer.at(0).sequence == 20);
+  buffer.freeze(F_PWM);
+  assert(buffer.frozen() && buffer.fault() == F_PWM);
+
   FakeStore store;
   FaultSummaryPersistence<FakeStore> persistence(store, 2);
   FaultSummary summary = {2, 42, F_STALL, 8, 11, 12, 1234};

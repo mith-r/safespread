@@ -42,6 +42,13 @@ class FaultBuffer {
     frozenFault_ = fault;
   }
 
+  void reset() {
+    start_ = 0;
+    count_ = 0;
+    isFrozen_ = false;
+    frozenFault_ = F_NONE;
+  }
+
   size_t size() const { return count_; }
   bool frozen() const { return isFrozen_; }
   FaultCode fault() const { return frozenFault_; }

@@ -92,6 +92,16 @@ inline int lookaheadRouteIndex(const PointT *route, int count, int fromIndex,
   return count - 1;
 }
 
+/** Curvature that intersects a lookahead point in the rover's travel frame.
+ *  Unlike a proportional steering command, this reproduces the radius of a
+ *  planned arc instead of waiting for cross-track error before steering hard. */
+inline float purePursuitCurvature(float headingErrorDeg, float targetDistanceFt) {
+  if (!(targetDistanceFt > 0.01f) || !std::isfinite(headingErrorDeg) ||
+      !std::isfinite(targetDistanceFt)) return 0.0f;
+  const float radians = headingErrorDeg * static_cast<float>(M_PI) / 180.0f;
+  return 2.0f * std::sin(radians) / targetDistanceFt;
+}
+
 // --- Straight-line following ---------------------------------------------
 // Pure pursuit chases a point ahead of the rover, and chasing lags: it reaches
 // the line carrying heading error, crosses it, and comes back. On a pass that

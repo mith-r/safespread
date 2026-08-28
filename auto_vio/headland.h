@@ -10,7 +10,7 @@ struct RouteRequirements {
 };
 
 // Route arcs are sampled every 0.5 ft. At the smallest planned turn radius
-// (2.92 ft measured * 1.3 planning margin), an extremum between samples can
+// (5.05 ft measured), an extremum between samples can
 // exceed both adjacent waypoints by just under 0.01 ft. Reserve that amount
 // whenever the route leaves an end of the rectangle so exact entered
 // clearance remains conservative for the continuous physical path.
@@ -66,6 +66,16 @@ inline RouteSelection selectRoute(float fieldPassFt, float fieldWidthFt,
                                   float availableStartFt, float availableEndFt,
                                   bool preferForwardOnly,
                                   RoutePoint *out, int maxOut) {
+  // Adjacent-lane three-point turns have the smallest headland envelope. Use
+  // them whenever they fit, even if the caller permits a wide forward loop.
+  const int threePointCount = buildRoute(
+      fieldPassFt, fieldWidthFt, barWidthFt, overlapFraction,
+      rLeftFt, rRightFt, out, maxOut);
+  const RouteRequirements threePoint = inspectRoute(out, threePointCount, fieldPassFt);
+  if (headlandFits(threePoint, availableStartFt, availableEndFt)) {
+    return {threePointCount, ROUTE_THREE_POINT, threePoint};
+  }
+
   if (preferForwardOnly) {
     const int forwardCount = buildForwardOnlyRoute(
         fieldPassFt, fieldWidthFt, barWidthFt, overlapFraction,
@@ -74,14 +84,6 @@ inline RouteSelection selectRoute(float fieldPassFt, float fieldWidthFt,
     if (headlandFits(forward, availableStartFt, availableEndFt)) {
       return {forwardCount, ROUTE_FORWARD_ONLY, forward};
     }
-  }
-
-  const int threePointCount = buildRoute(
-      fieldPassFt, fieldWidthFt, barWidthFt, overlapFraction,
-      rLeftFt, rRightFt, out, maxOut);
-  const RouteRequirements threePoint = inspectRoute(out, threePointCount, fieldPassFt);
-  if (headlandFits(threePoint, availableStartFt, availableEndFt)) {
-    return {threePointCount, ROUTE_THREE_POINT, threePoint};
   }
   return {0, ROUTE_NONE, threePoint};
 }

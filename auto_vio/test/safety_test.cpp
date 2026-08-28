@@ -45,8 +45,13 @@ int main() {
   assert(evaluateSafety(S_RUNNING, in) == F_NONE);
   in.bleConnected = false; assert(evaluateSafety(S_RUNNING, in) == F_BLE); in = safeInput();
   in.poseFresh = false; assert(evaluateSafety(S_RUNNING, in) == F_POSE_TIMEOUT); in = safeInput();
-  in.poseValid = false; assert(evaluateSafety(S_RUNNING, in) == F_POSE_INVALID); in = safeInput();
-  in.poseJumped = true; assert(evaluateSafety(S_RUNNING, in) == F_POSE_JUMP); in = safeInput();
+  // Invalid packets are ignored; loss of a usable stream is handled by the
+  // independent freshness timeout instead of an immediate fault 3.
+  in.poseValid = false; assert(evaluateSafety(S_RUNNING, in) == F_NONE); in = safeInput();
+  assert(!rejectedPoseRequiresFault(F_NONE));
+  assert(!rejectedPoseRequiresFault(F_POSE_INVALID));
+  assert(!rejectedPoseRequiresFault(F_POSE_JUMP));
+  in.poseJumped = true; assert(evaluateSafety(S_RUNNING, in) == F_NONE); in = safeInput();
   in.pwmReady = false; assert(evaluateSafety(S_RUNNING, in) == F_PWM); in = safeInput();
   in.i2cReady = false; assert(evaluateSafety(S_RUNNING, in) == F_I2C); in = safeInput();
   in.stalled = true; assert(evaluateSafety(S_RUNNING, in) == F_STALL); in = safeInput();

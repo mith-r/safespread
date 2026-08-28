@@ -181,14 +181,10 @@ export default function App() {
   function recordLog(record: MissionRecord) {
     const logger = loggerRef.current;
     if (!logger) return;
-    void logger.record(record).catch((error) => {
+    void logger.record(record).catch(() => {
+      if (loggerRef.current === logger) loggerRef.current = null;
+      setLogName(null);
       dispatch({ type: 'SET_LOGGING_READY', ready: false });
-      const current = setupRef.current;
-      if (current.wet && ['arming', 'armed', 'starting', 'running'].includes(current.phase)) {
-        void handleMissionFault(`authoritative mission log failed: ${error.message}`);
-      } else {
-        setOperationError(`Mission log failed: ${error.message}`);
-      }
     });
   }
 
@@ -230,8 +226,7 @@ export default function App() {
     // so a real mission must rebuild rather than inherit a headerless log.
     if (controlRef.current && senderRef.current && epochRef.current !== null &&
         resourceWetRef.current === setup.wet &&
-        (!requireRectangle || resourceHasRectangleRef.current) &&
-        (!setup.wet || isAuthoritativeLogReady(loggerRef.current))) {
+        (!requireRectangle || resourceHasRectangleRef.current)) {
       return { control: controlRef.current, epoch: epochRef.current };
     }
     if (controlRef.current || senderRef.current || loggerRef.current) {
@@ -267,10 +262,10 @@ export default function App() {
       loggerRef.current = logger;
       setLogName(fileLog.uri.split('/').pop() ?? missionId);
       dispatch({ type: 'SET_LOGGING_READY', ready: true });
-    } catch (error) {
+    } catch {
+      loggerRef.current = null;
+      setLogName(null);
       dispatch({ type: 'SET_LOGGING_READY', ready: false });
-      if (setup.wet) throw new Error(`Wet operation requires a mission log: ${error instanceof Error ? error.message : String(error)}`);
-      setOperationError(`Dry diagnostic log unavailable: ${error instanceof Error ? error.message : String(error)}`);
     }
     const control = new MissionControl(ble, epoch, () => trackingOkRef.current, {
       dryMode: !setup.wet,
@@ -284,7 +279,10 @@ export default function App() {
     epochRef.current = epoch;
     calibrationWireRef.current = wire;
     poseStreamingRef.current = true;
-    rectangleConfiguredRef.current = false;
+    // A mission's first pose must use the same frame as every later pose.
+    // Otherwise Configure changes world coordinates into rectangle coordinates
+    // and the rover correctly interprets the discontinuity as a pose jump.
+    rectangleConfiguredRef.current = !!setup.rectangle;
     calibrationPreparedRef.current = false;
     resourceWetRef.current = setup.wet;
     resourceHasRectangleRef.current = !!setup.rectangle;
@@ -549,6 +547,9 @@ export default function App() {
         trackingReason: vio.trackingReason,
         mappingStatus: vio.mappingStatus,
         senderDropped: sender.dropped,
+        relocalizationShiftFt: validated.relocalizationShiftFt,
+        accumulatedWorldOffsetXFt: validated.accumulatedWorldOffsetXFt,
+        accumulatedWorldOffsetYFt: validated.accumulatedWorldOffsetYFt,
       };
       poseBySequenceRef.current.set(validated.sequence, poseRecord);
       while (poseBySequenceRef.current.size > 256) {
@@ -704,7 +705,7 @@ export default function App() {
       operationGateRef.current.assertCurrent(operation.generation);
       const candidate = setupReducer({
         ...setup,
-        loggingReady: isAuthoritativeLogReady(loggerRef.current) || !setup.wet,
+        loggingReady: isAuthoritativeLogReady(loggerRef.current),
       }, { type: 'REQUEST_ARM' });
       if (candidate.phase !== 'arming') {
         throw new Error(candidate.validationError ?? 'Readiness checks did not pass.');
@@ -864,7 +865,6 @@ export default function App() {
     <SetupWizard
       state={setup}
       roverPose={vio.pose}
-      cameraPose={vio.validatedPose?.camera ?? null}
       trackingDetail={trackingDetail}
       readinessReason={vio.readiness.reason}
       calibration={calibration}

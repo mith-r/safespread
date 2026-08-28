@@ -198,7 +198,8 @@ FaultCode faultFromCell(const std::string &raw) {
   const auto result = std::from_chars(value.data(), value.data() + value.size(), numeric);
   if (result.ec == std::errc() && result.ptr == value.data() + value.size() &&
       numeric <= std::numeric_limits<uint8_t>::max()) {
-    return static_cast<FaultCode>(numeric);
+    const FaultCode fault = static_cast<FaultCode>(numeric);
+    return fault == F_POSE_INVALID ? F_POSE_TIMEOUT : fault;
   }
   std::string lower;
   lower.reserve(value.size());
@@ -213,7 +214,7 @@ FaultCode faultFromCell(const std::string &raw) {
   if (lower.find("i2c") != std::string::npos) return F_I2C;
   if (lower.find("stall") != std::string::npos) return F_STALL;
   if (lower.find("direction") != std::string::npos) return F_WRONG_DIRECTION;
-  if (lower.find("pose") != std::string::npos) return F_POSE_INVALID;
+  if (lower.find("pose") != std::string::npos) return F_POSE_TIMEOUT;
   return F_ROUTE;
 }
 

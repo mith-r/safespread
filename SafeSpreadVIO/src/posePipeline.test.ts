@@ -126,10 +126,10 @@ describe('PosePipeline drive rejection', () => {
     ).toEqual({ ok: false, reason: 'age' });
   });
 
-  it('rejects implausible speed, acceleration, yaw rate, and position innovation', () => {
+  it('rejects implausible speed, acceleration, and yaw rate', () => {
     const speed = new PosePipeline({ ...calibration, cameraForwardFt: 0 });
     accepted(speed, poseEvent(1, 0, { y: 0 }), 1000);
-    expect(speed.ingest(poseEvent(2, 100, { y: 1 }), 1100)).toEqual({
+    expect(speed.ingest(poseEvent(2, 50, { y: 0.5 }), 1050)).toEqual({
       ok: false,
       reason: 'speed',
     });
@@ -137,7 +137,7 @@ describe('PosePipeline drive rejection', () => {
     const acceleration = new PosePipeline({ ...calibration, cameraForwardFt: 0 });
     accepted(acceleration, poseEvent(1, 0, { y: 0 }), 1000);
     accepted(acceleration, poseEvent(2, 100, { y: 0.1 }), 1100);
-    expect(acceleration.ingest(poseEvent(3, 200, { y: 1 }), 1200)).toEqual({
+    expect(acceleration.ingest(poseEvent(3, 200, { y: 0.8 }), 1200)).toEqual({
       ok: false,
       reason: 'acceleration',
     });
@@ -148,13 +148,31 @@ describe('PosePipeline drive rejection', () => {
       ok: false,
       reason: 'yawRate',
     });
+  });
 
-    const innovation = new PosePipeline({ ...calibration, cameraForwardFt: 0 });
-    accepted(innovation, poseEvent(1, 0, { y: 0 }), 1000);
-    expect(innovation.ingest(poseEvent(2, 1000, { y: 1 }), 2000)).toEqual({
-      ok: false,
-      reason: 'innovation',
-    });
+  it('absorbs an ARKit world translation and preserves subsequent motion', () => {
+    const pipeline = new PosePipeline({ ...calibration, cameraForwardFt: 0 });
+    accepted(pipeline, poseEvent(1, 0, { x: 0, y: 0 }), 1000);
+
+    const corrected = accepted(
+      pipeline,
+      poseEvent(2, 16, { x: 1.33, y: 0.05 }),
+      1016,
+    );
+    expect(corrected.rover.x).toBeCloseTo(0, 6);
+    expect(corrected.rover.y).toBeCloseTo(0, 6);
+    expect(corrected.relocalizationShiftFt).toBeCloseTo(Math.hypot(1.33, 0.05), 6);
+
+    const continued = accepted(
+      pipeline,
+      poseEvent(3, 32, { x: 1.34, y: 0.05 }),
+      1032,
+    );
+    expect(continued.rover.x).toBeCloseTo(0.01, 6);
+    expect(continued.rover.y).toBeCloseTo(0, 6);
+    expect(continued.relocalizationShiftFt).toBe(0);
+    expect(continued.accumulatedWorldOffsetXFt).toBeCloseTo(-1.33, 6);
+    expect(continued.accumulatedWorldOffsetYFt).toBeCloseTo(-0.05, 6);
   });
 });
 
@@ -179,15 +197,17 @@ describe('PosePipeline standstill noise', () => {
     }
   });
 
-  it('keeps the arming window through a motion-gate rejection', () => {
+  it('keeps the arming window through an automatic world-frame correction', () => {
     const pipeline = new PosePipeline(calibration);
     const lastReceived = fillStationaryWindow(pipeline);
     expect(pipeline.readiness(lastReceived).ready).toBe(true);
 
-    // One relocalisation snap is a hiccup, not a loss of tracking: it must not
-    // cost the operator the two seconds of stillness already banked.
-    expect(pipeline.ingest(poseEvent(40, 2100, { x: 6 }), lastReceived + 34))
-      .toEqual({ ok: false, reason: 'innovation' });
+    const corrected = accepted(
+      pipeline,
+      poseEvent(40, 2100, { x: 6 }),
+      lastReceived + 34,
+    );
+    expect(corrected.relocalizationShiftFt).toBeGreaterThan(5);
     expect(pipeline.readiness(lastReceived + 34).ready).toBe(true);
   });
 });

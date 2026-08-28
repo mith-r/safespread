@@ -5,43 +5,39 @@
 #include "../headland.h"
 #include "../route.h"
 
-static const float BAR     = 17.0f / 12.0f;
-static const float OVERLAP = 0.15f;
+static const float BAR     = 21.0f / 12.0f;
+static const float OVERLAP = 0.0f;
 // The rover's measured circles, which are not the same size.
-static const float RL = 4.33f;
-static const float RR = 2.92f;
+static const float RL = 5.54f;
+static const float RR = 5.05f;
 
 static RoutePoint pts[6000];
 static RoutePoint sim[6000];
 
-static const float MAX_OFFSET   = 700.0f;
-static const float PURSUIT_GAIN = 16.0f;
-
-/** The curvature the rover actually ends up with for a given steering command,
- *  including saturation at each side's own lock. Modelling this rather than
- *  "turn as hard as needed" is what makes the simulation say the same thing
- *  the firmware will do -- an optimistic steering model here was reporting
- *  tracking a third better than the real law achieves. */
-static float appliedKappa(float commandUs) {
-  if (commandUs > MAX_OFFSET)  commandUs = MAX_OFFSET;
-  if (commandUs < -MAX_OFFSET) commandUs = -MAX_OFFSET;
-  float kMax = (commandUs >= 0.0f) ? 1.0f / RR : 1.0f / RL;
-  return (commandUs / MAX_OFFSET) * kMax;
+/** Curvature the travel path actually gets after the measured steering map
+ *  saturates. Reversing swaps which physical lock produces a given path bend,
+ *  which matters because this rover's left and right circles are unequal. */
+static float appliedPathKappa(float requested, bool reverse) {
+  float steering = reverse ? -requested : requested;
+  if (steering > 1.0f / RR) steering = 1.0f / RR;
+  if (steering < -1.0f / RL) steering = -1.0f / RL;
+  return reverse ? -steering : steering;
 }
 
 // Drive a simulated Ackermann rover, with the rover's real asymmetric radii,
 // along the whole plan -- reversing legs included. This is the part that used
 // to fail on grass with no way to see why.
-static void simulatePrepared(float field, const char *label, int n) {
+static void simulatePrepared(float passLength, float width,
+                             const char *label, int n) {
   const float STEP           = 0.15f;   // ft per tick
   const float LINE_T         = 1.5f;    // straight-run convergence constant
   const float LOOKAHEAD_TURN = 1.0f;    // shorter than the tightest radius
-  const float CUSP_TOL       = 0.5f;
+  const float CUSP_TOL       = 0.1f;
   const int   WINDOW         = 80;
   const float SPRAY_OFF      = 1.5f;
   const float SPRAY_OFF_1ST  = 3.0f;
 
-  int lanes = laneCount(field, BAR, OVERLAP);
+  int lanes = laneCount(width, BAR, OVERLAP);
   assert(n > 20);
 
   int firstPassEnd = n;
@@ -63,25 +59,27 @@ static void simulatePrepared(float field, const char *label, int n) {
 
     bool rev = sim[idx].reverse;
     float reference = rev ? fmodf(heading + 180.0f, 360.0f) : heading;
-    float command, crossNow = 0.0f;
+    float requestedCurvature, crossNow = 0.0f;
 
     if (sim[idx].turning) {
       int la = lookaheadWithinSegment(sim, n, idx, x, y, LOOKAHEAD_TURN);
-      float want = bearingToWaypointDeg(sim[la].x - x, sim[la].y - y);
-      command = angleDiffDeg(want, reference) * PURSUIT_GAIN;
+      float dx = sim[la].x - x, dy = sim[la].y - y;
+      float want = bearingToWaypointDeg(dx, dy);
+      requestedCurvature = purePursuitCurvature(
+          angleDiffDeg(want, reference), std::sqrt(dx * dx + dy * dy));
     } else {
       // The same law the firmware uses on straight runs.
       float lineHeading = segmentHeadingDeg(sim, n, idx);
       crossNow = crossTrackFt(sim[idx].x, sim[idx].y, lineHeading, x, y);
       float headingErr = angleDiffDeg(lineHeading, reference);
-      command = curvatureToCommand(lineFollowCurvature(crossNow, headingErr, LINE_T),
-                                   RL, RR, MAX_OFFSET);
+      requestedCurvature = lineFollowCurvature(crossNow, headingErr, LINE_T);
     }
 
     // Both driving forward and backing up, the travel direction turns the same
     // way for a given command: the firmware mirrors the steering in reverse and
     // the physics mirrors it back.
-    float turn = appliedKappa(command) * STEP * 180.0f / (float)M_PI;
+    float turn = appliedPathKappa(requestedCurvature, rev) *
+                 STEP * 180.0f / (float)M_PI;
     heading = fmodf(heading + turn + 360.0f, 360.0f);
     float rad = heading * (float)M_PI / 180.0f;
     float sgn = rev ? -1.0f : 1.0f;
@@ -106,7 +104,7 @@ static void simulatePrepared(float field, const char *label, int n) {
     if (spraying) sprayedFt += STEP;
 
     // The first pass must spray without interruption along its length.
-    if (idx < firstPassEnd && !spraying && y > 0.5f && y < field - 0.5f) {
+    if (idx < firstPassEnd && !spraying && y > 0.5f && y < passLength - 0.5f) {
       firstPassGap = true;
     }
     ticks++;
@@ -129,7 +127,7 @@ static void simulatePrepared(float field, const char *label, int n) {
   // which is what "it drives back over what it just covered" looks like.
   assert(worstStraight < 0.5f * laneSpacing(BAR, OVERLAP));
 
-  float wanted = lanes * field;
+  float wanted = lanes * passLength;
   assert(sprayedFt > 0.92f * wanted);
 
   printf("route_test: %s -> %d ticks, worst %.2f ft off plan, "
@@ -139,7 +137,7 @@ static void simulatePrepared(float field, const char *label, int n) {
 
 static void simulateFollow(float field, const char *label) {
   int n = buildRoute(field, field, BAR, OVERLAP, RL, RR, sim, 6000);
-  simulatePrepared(field, label, n);
+  simulatePrepared(field, field, label, n);
 }
 
 int main() {
@@ -283,35 +281,60 @@ int main() {
   }
 
   // --- following the route, reversing included ----------------------------
+  // Every direction change must be represented by the exact geometric cusp,
+  // not whichever half-foot route sample happened to fall nearest it.
+  {
+    TurnPlan p;
+    assert(planHeadlandTurn(laneSpacing(BAR, OVERLAP), RL, RR, p));
+    RoutePoint emitted[100];
+    const int emittedCount = emitTurn(emitted, 100, p, 0.0f, 0.0f, 0.0f);
+    float distance = 0.0f;
+    for (int leg = 0; leg + 1 < p.legCount; ++leg) {
+      distance += turnLegLength(p.leg[leg]);
+      float x, y, heading; bool reverse;
+      turnPoseAt(p, distance, x, y, heading, reverse);
+      bool found = false;
+      for (int point = 0; point < emittedCount; ++point) {
+        if (std::fabs(emitted[point].x - x) < 1e-4f &&
+            std::fabs(emitted[point].y - y) < 1e-4f &&
+            emitted[point].reverse == p.leg[leg].reverse) {
+          found = true;
+          break;
+        }
+      }
+      assert(found);
+    }
+  }
+
   simulateFollow(FIELD, "real field");
+  simulateFollow(14.0f, "14x14");
   simulateFollow(10.0f, "10x10");
   simulateFollow(6.0f, "6x6");
 
-  // --- prefer a continuous forward route when the pavement fits -----------
+  // --- retain forward-only planning, but select the compact route ----------
   {
     static RoutePoint selected[6000];
-    RouteSelection forward = selectRoute(
-        FIELD, FIELD, BAR, OVERLAP, RL, RR,
-        100.0f, 100.0f, true, selected, 6000);
-    assert(forward.style == ROUTE_FORWARD_ONLY);
-    assert(forward.count > 0 && !forward.requirements.truncated);
-    assert(forward.requirements.reversals == 0);
+    const int forwardCount = buildForwardOnlyRoute(
+        FIELD, FIELD, BAR, OVERLAP, RL, RR, selected, 6000);
+    const RouteRequirements forward = inspectRoute(selected, forwardCount, FIELD);
+    assert(forwardCount > 0 && !forward.truncated);
+    assert(forward.reversals == 0);
     float forwardMinX = selected[0].x, forwardMaxX = selected[0].x;
-    for (int i = 1; i < forward.count; ++i) {
+    for (int i = 1; i < forwardCount; ++i) {
       if (selected[i].x < forwardMinX) forwardMinX = selected[i].x;
       if (selected[i].x > forwardMaxX) forwardMaxX = selected[i].x;
     }
     std::printf("route_test: forward-only -> %d points, needs %.1f/%.1f ft headland, x %.1f..%.1f\n",
-                forward.count, forward.requirements.beforeStartFt,
-                forward.requirements.beyondEndFt, forwardMinX, forwardMaxX);
-    for (int i = 0; i < forward.count; ++i) assert(!selected[i].reverse);
+                forwardCount, forward.beforeStartFt,
+                forward.beyondEndFt, forwardMinX, forwardMaxX);
+    for (int i = 0; i < forwardCount; ++i) assert(!selected[i].reverse);
 
     // The far-lane ordering changes visit order, never lane placement: every
-    // lane at the unchanged 15% overlap spacing still receives a full pass.
+    // lane at the configured zero-overlap spacing still receives a full pass.
     for (int lane = 0; lane < lanes; ++lane) {
       const float laneX = laneCenterX(lane, BAR, OVERLAP);
       bool covered = false;
-      for (int i = 0; i < forward.count; ++i) {
+      for (int i = 0; i < forwardCount; ++i) {
         if (selected[i].spray && std::fabs(selected[i].x - laneX) < 0.05f) {
           covered = true;
           break;
@@ -323,22 +346,40 @@ int main() {
     // Exercise the selected forward-only plan through the same tracker model
     // as the reversing route. Geometry alone cannot prove that its longer
     // Dubins transitions remain followable by the production control law.
-    std::memcpy(sim, selected, forward.count * sizeof(RoutePoint));
-    simulatePrepared(FIELD, "forward-only", forward.count);
+    std::memcpy(sim, selected, forwardCount * sizeof(RoutePoint));
+    simulatePrepared(FIELD, FIELD, "forward-only", forwardCount);
 
     static RoutePoint kturn[6000];
     int kCount = buildRoute(FIELD, FIELD, BAR, OVERLAP, RL, RR, kturn, 6000);
     RouteRequirements kNeeds = inspectRoute(kturn, kCount, FIELD);
-    assert(forward.requirements.beforeStartFt > kNeeds.beforeStartFt + 0.01f ||
-           forward.requirements.beyondEndFt > kNeeds.beyondEndFt + 0.01f);
+    assert(forward.beforeStartFt > kNeeds.beforeStartFt + 0.01f ||
+           forward.beyondEndFt > kNeeds.beyondEndFt + 0.01f);
 
-    RouteSelection fallback = selectRoute(
+    RouteSelection compact = selectRoute(
         FIELD, FIELD, BAR, OVERLAP, RL, RR,
-        kNeeds.beforeStartFt, kNeeds.beyondEndFt,
+        100.0f, 100.0f,
         true, selected, 6000);
-    assert(fallback.style == ROUTE_THREE_POINT);
-    assert(fallback.count == kCount);
-    assert(fallback.requirements.reversals > 0);
+    assert(compact.style == ROUTE_THREE_POINT);
+    assert(compact.count == kCount);
+    assert(compact.requirements.reversals > 0);
+  }
+
+  // The shipping 40x12 setup with 8 ft at each end must choose the compact
+  // reversing route and remain inside the entered headland.
+  {
+    static RoutePoint plan[6000];
+    RouteSelection selected = selectRoute(
+        40.0f, 12.0f, BAR, OVERLAP, RL, RR,
+        8.0f, 8.0f, true, plan, 6000);
+    assert(selected.style == ROUTE_THREE_POINT);
+    assert(selected.count > 0 && !selected.requirements.truncated);
+    assert(selected.requirements.beforeStartFt <= 8.0f);
+    assert(selected.requirements.beyondEndFt <= 8.0f);
+    std::memcpy(sim, plan, selected.count * sizeof(RoutePoint));
+    simulatePrepared(40.0f, 12.0f, "default 40x12", selected.count);
+    std::printf("route_test: default 40x12 -> needs %.2f/%.2f ft headland\n",
+                selected.requirements.beforeStartFt,
+                selected.requirements.beyondEndFt);
   }
 
   // Passes are addressable so a faulted mission can resume on the one it was

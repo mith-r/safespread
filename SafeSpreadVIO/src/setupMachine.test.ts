@@ -195,7 +195,7 @@ describe('setupReducer', () => {
   });
 
   it.each(['missing', 'stale'] as const)(
-    'blocks wet arming for %s calibration but permits dry diagnostics',
+    'permits wet and dry arming with %s calibration',
     (status) => {
       let wet = enteredReadyState({ wet: true });
       wet = reduce(
@@ -203,8 +203,7 @@ describe('setupReducer', () => {
         { type: 'SET_CALIBRATION_STATUS', status },
         { type: 'REQUEST_ARM' },
       );
-      expect(wet.phase).toBe('readiness');
-      expect(wet.validationError).toMatch(/calibration/i);
+      expect(wet.phase).toBe('arming');
 
       let dry = enteredReadyState();
       dry = reduce(
@@ -216,20 +215,20 @@ describe('setupReducer', () => {
     },
   );
 
-  it('blocks wet arming when logging fails but permits a warned dry diagnostic', () => {
+  it('permits wet and dry arming when logging is unavailable', () => {
     const wet = setupReducer(
       enteredReadyState({ wet: true, loggingReady: false }),
       { type: 'REQUEST_ARM' },
     );
-    expect(wet.phase).toBe('readiness');
-    expect(wet.validationError).toMatch(/log/i);
+    expect(wet.phase).toBe('arming');
+    expect(wet.warning).toMatch(/continues without a log/i);
 
     const dry = setupReducer(
       enteredReadyState({ wet: false, loggingReady: false }),
       { type: 'REQUEST_ARM' },
     );
     expect(dry.phase).toBe('arming');
-    expect(dry.warning).toMatch(/log/i);
+    expect(dry.warning).toMatch(/continues without a log/i);
   });
 
   it('turns an acknowledgement timeout into a visible fault', () => {

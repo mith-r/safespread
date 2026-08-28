@@ -126,7 +126,7 @@ export function initialSetupState(): SetupState {
     phase: 'connection',
     connectionStatus: 'disconnected',
     compatible: false,
-    rectangleMode: null,
+    rectangleMode: 'entered',
     rectangle: null,
     cornerA: null,
     coverageSideConfirmed: false,
@@ -168,12 +168,6 @@ function canArm(state: SetupState): string | null {
     return state.rectangleMode === 'walked'
       ? 'Return the rover to Corner A before arming.'
       : 'Move the rover to the rectangle start before arming.';
-  }
-  if (state.wet && state.calibrationStatus !== 'ready') {
-    return 'Wet operation requires a current matching calibration.';
-  }
-  if (state.wet && !state.loggingReady) {
-    return 'Wet operation requires a writable mission log.';
   }
   return null;
 }
@@ -272,7 +266,12 @@ export function setupReducer(state: SetupState, action: SetupAction): SetupState
       return { ...state, wet: action.wet, validationError: null };
 
     case 'SET_LOGGING_READY':
-      return { ...state, loggingReady: action.ready, validationError: null };
+      return {
+        ...state,
+        loggingReady: action.ready,
+        validationError: null,
+        warning: action.ready ? null : 'Mission log unavailable; operation continues without a log.',
+      };
 
     case 'SET_READINESS':
       return {
@@ -302,9 +301,6 @@ export function setupReducer(state: SetupState, action: SetupAction): SetupState
         return { ...state, phase: 'readiness', validationError: null };
       }
       if (state.phase === 'calibration') {
-        if (state.wet && state.calibrationStatus !== 'ready') {
-          return fail(state, 'Wet operation requires a current matching calibration.');
-        }
         return { ...state, phase: 'readiness', validationError: null };
       }
       return fail(state, 'Continue is not available in the current phase.');
@@ -317,7 +313,7 @@ export function setupReducer(state: SetupState, action: SetupAction): SetupState
         ...state,
         phase: 'arming',
         validationError: null,
-        warning: state.loggingReady ? null : 'Mission log unavailable; dry diagnostic only.',
+        warning: state.loggingReady ? null : 'Mission log unavailable; operation continues without a log.',
       };
     }
 

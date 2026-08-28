@@ -29,6 +29,7 @@
 #include "mission_protocol.h"
 #include "nav_math.h"
 #include "protocol_v2.h"
+#include "pwm_health.h"
 #include "route.h"
 #include "safety.h"
 #include "speed_control.h"
@@ -58,8 +59,8 @@ const int STEER_CENTER_US = 1500;
 const int STEER_LEFT_US   = 2390;
 const int STEER_RIGHT_US  = 700;
 
-const float BAR_WIDTH_FT          = 17.0f / 12.0f;
-const float LANE_OVERLAP_FRACTION = 0.15f;
+const float BAR_WIDTH_FT          = 21.0f / 12.0f;
+const float LANE_OVERLAP_FRACTION = 0.0f;
 
 // N x M, matching the app's two inputs and set at runtime via '!D'.
 //   N (fieldPassFt)  -- length of the first pass, straight ahead from the
@@ -68,16 +69,14 @@ const float LANE_OVERLAP_FRACTION = 0.15f;
 float fieldPassFt  = 21.91f;
 float fieldWidthFt = 21.91f;
 
-// The rover's two turning circles, measured 2026-08-26 with the sketch in
-// turn_radius/. They are not the same size -- the steering trim sits
-// off-centre -- and averaging them would ask for left turns tighter than the
-// rover can drive and right turns wider than it needs, so both are carried
-// separately all the way through the planner.
-//
-// Re-measure after any steering linkage or trim change: flash
-// turn_radius/turn_radius.ino, press Start, and copy the two numbers here.
-float turnRadiusLeftFt  = 4.33f;
-float turnRadiusRightFt = 2.92f;
+// Full-lock radii observed from the 2026-08-28 wet mission telemetry. The
+// servo was already commanded to both configured stops throughout the turns,
+// but the vehicle produced substantially wider circles than the old dry
+// 4.33/2.92 ft measurements. Planning with those stale radii made the route
+// change legs before the nose had rotated far enough, then forced a huge loop
+// inside the rectangle to recover.
+float turnRadiusLeftFt  = 5.54f;
+float turnRadiusRightFt = 5.05f;
 
 // The pulse at which the wheels actually point straight ahead. It is NOT the
 // midpoint of the servo's travel, and assuming it was is what made every
@@ -89,9 +88,9 @@ float turnRadiusRightFt = 2.92f;
 // not a midpoint inferred from the two steering endpoints. Runtime control
 // interpolates this table without silently relearning its center.
 SteeringKnot steeringMap[MAX_CALIBRATION_KNOTS] = {
-  {STEER_LEFT_US, -1.0f / 4.33f},
+  {STEER_LEFT_US, -1.0f / 5.54f},
   {1709, 0.0f},
-  {STEER_RIGHT_US, 1.0f / 2.92f},
+  {STEER_RIGHT_US, 1.0f / 5.05f},
 };
 int steeringMapCount = 3;
 bool steeringMapValid = false;
@@ -250,14 +249,13 @@ const float RESUME_HEADING_TOLERANCE_DEG = 12.0f;
 // lookahead tracks smoothly; through a turn it must be shorter than the arc's
 // radius or the rover simply cuts the corner and misses the maneuver.
 const float LOOKAHEAD_TURN_FT = 1.0f;
-const float PURSUIT_GAIN      = 16.0f;   // us of steering per degree of error
 
 // How sharply the rover converges onto a straight pass, in feet. Smaller is
 // quicker but works the steering harder against position noise; 1.5 ft closes
 // a foot of error in about 6 ft of travel without ever crossing the line.
 const float LINE_DISTANCE_CONST_FT = 1.5f;
 const int   ROUTE_SEARCH_WINDOW = ROUTE_PROGRESS_SEARCH_WINDOW;
-const float CUSP_TOL_FT       = 0.5f;
+const float CUSP_TOL_FT       = 0.1f;
 
 bool escReverse = false;
 bool directionRequested = false;
@@ -283,6 +281,7 @@ bool targetDistanceValid = false;
 const float SPRAY_OFFPLAN_FT       = 1.5f;
 const float SPRAY_OFFPLAN_FIRST_FT = 3.0f;   // the first pass gets more rope
 const float SPRAY_HYSTERESIS_FT    = 0.5f;
+const float SPRAY_HEADING_TOLERANCE_DEG = 10.0f;
 bool sprayInhibited = false;
 
 // How far the rover currently sits from the point it is tracking, and the
@@ -388,6 +387,8 @@ int lastEscUs   = NEUTRAL_US;
 unsigned long lastPwmCheck = 0;
 unsigned long pwmRecoveries = 0;
 bool pwmHealthy = false;
+bool pwmMissionReady = false;
+PwmReadinessGate pwmReadiness;
 
 bool safetyEventPending() {
   bool pending;
@@ -424,7 +425,15 @@ bool ensurePwmReady() {
   uint8_t mode1 = readPcaRegister(PCA_MODE1);
   uint8_t prescale = readPcaRegister(PCA_PRESCALE);
 
-  if (mode1 == 0xFF && prescale == 0xFF) {
+  // A single I2C miss can be electrical noise. Retry once before treating the
+  // controller as unavailable.
+  if (mode1 == 0xFF || prescale == 0xFF) {
+    delay(2);
+    mode1 = readPcaRegister(PCA_MODE1);
+    prescale = readPcaRegister(PCA_PRESCALE);
+  }
+
+  if (mode1 == 0xFF || prescale == 0xFF) {
     pwmHealthy = false;
     return false;
   }
@@ -447,8 +456,23 @@ bool ensurePwmReady() {
   // pose or command.
   setChannelPulse(ESC_CH, NEUTRAL_US);
   setChannelPulse(STEER_CH, (int)steerCentreUs());
-  pwmHealthy = false;
-  return false;
+
+  // Recovery used to return false unconditionally, so even a successful
+  // reinitialisation immediately latched fault 5. Verify the new state and
+  // report ready when the chip is awake at the correct output rate.
+  mode1 = readPcaRegister(PCA_MODE1);
+  prescale = readPcaRegister(PCA_PRESCALE);
+  bool recovered = mode1 != 0xFF && prescale != 0xFF &&
+                   (mode1 & PCA_SLEEP_BIT) == 0 &&
+                   abs((int)prescale - PCA_EXPECTED_PRESCALE) <= 3;
+  pwmHealthy = recovered;
+  if (recovered) {
+    bleLog("[OK] PWM chip recovered and verified.");
+  } else {
+    bleLog("!! PWM recovery did not verify (mode1=0x" + String(mode1, HEX) +
+           " prescale=" + String(prescale) + ").");
+  }
+  return recovered;
 }
 
 // In dry-run mode the spray state is still tracked and reported so the app can
@@ -494,15 +518,10 @@ void applyMotionCalibration(const CompactMotionCalibration &calibration) {
   reverseFeedForwardUs = calibration.reverseFeedForwardUs;
 }
 
-bool motionCalibrationMatchesMission() {
-  return hasStoredMotionCalibration &&
-         calibrationIdentityMatches(storedMotionCalibration,
-                                    mission.calibration().schemaVersion,
-                                    mission.calibrationId(), HARDWARE_TAG_HASH);
-}
-
 bool motionCalibrationReady() {
-  return steeringMapValid && (dryRunMode || motionCalibrationMatchesMission());
+  // A stored calibration improves tracking, but it is not required. The
+  // compiled-in steering map and feed-forward values are the wet-mode fallback.
+  return steeringMapValid;
 }
 
 uint16_t saturatedPacketDrops() {
@@ -1355,12 +1374,16 @@ void updateSpray() {
   float dx = p.x - robotX_ft, dy = p.y - robotY_ft;
   float off = sqrtf(dx * dx + dy * dy);
   float limit = (routeIndex < firstPassEnd) ? SPRAY_OFFPLAN_FIRST_FT : SPRAY_OFFPLAN_FT;
+  const float passHeading = segmentHeadingDeg(route, routeCount, routeIndex);
+  const float headingError = fabsf(angleDiffDeg(passHeading, robotHeading));
+  const bool aligned = headingError <= SPRAY_HEADING_TOLERANCE_DEG;
 
   if (sprayInhibited) {
-    if (off < limit - SPRAY_HYSTERESIS_FT) sprayInhibited = false;
-  } else if (off > limit) {
+    if (off < limit - SPRAY_HYSTERESIS_FT && aligned) sprayInhibited = false;
+  } else if (off > limit || !aligned) {
     sprayInhibited = true;
-    bleLog("!! " + String(off, 1) + " ft off plan -- spray paused.");
+    bleLog("!! Pass entry not aligned (off=" + String(off, 1) +
+           " ft heading=" + String(headingError, 0) + " deg) -- spray paused.");
   }
 
   setSpray(!sprayInhibited);
@@ -1474,8 +1497,13 @@ void runFollow() {
     float want = bearingToWaypointDeg(route[la].x - robotX_ft,
                                       route[la].y - robotY_ft);
     err = angleDiffDeg(want, reference);
-    command = err * PURSUIT_GAIN;
-    requestedCurvature = curvatureForCommand(command);
+    const float targetDistance = sqrtf(
+        (route[la].x - robotX_ft) * (route[la].x - robotX_ft) +
+        (route[la].y - robotY_ft) * (route[la].y - robotY_ft));
+    requestedCurvature = purePursuitCurvature(err, targetDistance);
+    command = curvatureToCommand(requestedCurvature,
+                                 turnRadiusLeftFt, turnRadiusRightFt,
+                                 MAX_STEER_OFFSET);
     lastCrossTrackFt = offPlanFt;
   } else {
     // On a straight run -- which is every sprayed pass -- steer onto the line
@@ -1523,7 +1551,15 @@ void runFollow() {
   if (driveDirection.phase == D_COMMAND ||
       driveDirection.phase == D_VERIFY ||
       driveDirection.phase == D_READY) {
-    const float targetMagnitude = route[routeIndex].turning
+    // Arrive at the rectangle edge already at turn speed. Entering the first
+    // arc at 1.5 ft/s consumed about a foot before the speed controller could
+    // slow the rover and made the physical turn wider still.
+    bool turnIsNear = route[routeIndex].turning;
+    for (int ahead = 1; !turnIsNear && ahead <= 6 &&
+         routeIndex + ahead < routeCount; ++ahead) {
+      turnIsNear = route[routeIndex + ahead].turning;
+    }
+    const float targetMagnitude = turnIsNear
         ? DEFAULT_TURN_SPEED_FPS : DEFAULT_STRAIGHT_SPEED_FPS;
     const float targetSpeed = reversing ? -targetMagnitude : targetMagnitude;
     const float measuredSpeed = reversing
@@ -1589,15 +1625,12 @@ void feed(const uint8_t *d, size_t n, uint32_t receivedAtMs) {
       protocol_v2::PoseV2 pose = {};
       if (!protocol_v2::parsePoseV2(d, n, pose)) {
         invalidPacketCount++;
-        if (mission.state() == S_ARMED || mission.state() == S_RUNNING) {
-          enterFault(F_POSE_INVALID);
-        }
       } else if (!mission.acceptPose(pose, receivedAtMs)) {
         invalidPacketCount++;
         notePoseReject(mission.lastPoseReject());
         if (mission.state() == S_ARMED || mission.state() == S_RUNNING) {
           FaultCode fault = mission.lastPoseRejectFault();
-          enterFault(fault == F_NONE ? F_POSE_INVALID : fault);
+          if (rejectedPoseRequiresFault(fault)) enterFault(fault);
         }
       }
       return;
@@ -1611,6 +1644,13 @@ void feed(const uint8_t *d, size_t n, uint32_t receivedAtMs) {
       }
       protocol_v2::AckV2 ack = mission.acceptCalibration(calibration, receivedAtMs);
       if (ack.faultCode == F_NONE && !mission.lastSetupWasDuplicate()) {
+        // A new epoch owns a new black box. Never relabel a frozen buffer from
+        // an older mission with the new epoch, and keep rejection counters
+        // scoped to the mission they describe.
+        faultBuffer.reset();
+        invalidPacketCount = 0;
+        for (uint8_t code = 0; code <= F_HEADLAND; ++code) poseRejectCounts[code] = 0;
+        lastPoseRejectLogMs = 0;
         resetMotionCalibrationSession();
       }
       sendAck(ack);
@@ -1635,10 +1675,6 @@ void feed(const uint8_t *d, size_t n, uint32_t receivedAtMs) {
         if (routeCount < 2 || routeStyle == ROUTE_NONE) {
           enterFault(routePlanningFault);
           ack = mission.overrideLastSetupWithFault(routePlanningFault);
-        } else if (!motionCalibrationReady()) {
-          bleLog("!! Wet operation requires a stored motion calibration matching this mission ID.");
-          enterFault(F_CALIBRATION);
-          ack = mission.overrideLastSetupWithFault(F_CALIBRATION);
         }
       }
       sendAck(ack);
@@ -1710,9 +1746,6 @@ void feed(const uint8_t *d, size_t n, uint32_t receivedAtMs) {
     }
 
     invalidPacketCount++;
-    if (mission.state() == S_ARMED || mission.state() == S_RUNNING) {
-      enterFault(F_POSE_INVALID);
-    }
     return;
   }
 
@@ -1825,7 +1858,7 @@ class ServerCallbacks : public BLEServerCallbacks {
            String(turnRadiusRightFt, 2) + " ft.");
     bleLog(hasStoredMotionCalibration
         ? "[CAL] Stored motion calibration loaded."
-        : "[CAL] No valid stored motion calibration; wet operation is blocked.");
+        : "[CAL] Using built-in motion settings; wet operation is available.");
     bleLog(dryRunMode ? "[MODE] DRY" : "[MODE] WET");
     bleLog(sprayActive ? "[SPRAY] ON" : "[SPRAY] OFF");
     if (hasBootFaultSummary) {
@@ -1870,7 +1903,8 @@ void setup() {
   pwm.setPWMFreq(50);
   delay(50);
   stopDrive();
-  mission.setPwmReady(ensurePwmReady());
+  pwmMissionReady = pwmReadiness.observe(ensurePwmReady());
+  mission.setPwmReady(pwmMissionReady);
 
   hasBootFaultSummary = faultSummary.load(bootFaultSummary);
 
@@ -1905,9 +1939,14 @@ void loop() {
   if (millis() - lastPwmCheck >= 500) {
     lastPwmCheck = millis();
     bool ready = ensurePwmReady();
-    mission.setPwmReady(ready);
-    if (!ready && (mission.state() == S_CONFIGURED ||
-                   mission.state() == S_ARMED || mission.state() == S_RUNNING)) {
+    pwmMissionReady = pwmReadiness.observe(ready);
+    mission.setPwmReady(pwmMissionReady);
+    if (!ready && pwmReadiness.consecutiveFailures() == 1) {
+      bleLog("[WARN] PWM check missed; retrying before fault.");
+    }
+    if (!pwmMissionReady && (mission.state() == S_CONFIGURED ||
+                             mission.state() == S_ARMED ||
+                             mission.state() == S_RUNNING)) {
       enterFault(F_PWM);
     }
   }
@@ -1918,8 +1957,8 @@ void loop() {
       mission.poseFresh(millis()),
       true,
       false,
-      pwmHealthy,
-      pwmHealthy,
+      pwmMissionReady,
+      pwmMissionReady,
       driveDirection.noDisplacement || speedController.stalled,
       driveDirection.wrongDirection,
       true,

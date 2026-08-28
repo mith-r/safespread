@@ -7,8 +7,8 @@
 // That single maneuver is the only transit a back-and-forth coverage route
 // needs, and solving exactly that problem beats a general pose-to-pose planner
 // here: the answer is closed form, and it can carry the rover's two turning
-// radii separately. Ours measured 4.33 ft to the left and 2.92 ft to the right
-// -- the steering trim sits off-centre -- so planning on one averaged radius
+// radii separately. The current wet response measures 5.54 ft to the left and
+// 5.05 ft to the right, so planning on one averaged radius
 // would ask for left turns tighter than the rover can drive and right turns
 // wider than it needs.
 //
@@ -128,10 +128,28 @@ inline bool solveForwardUTurn(float shiftFt, float rLeft, float rRight,
   return false;
 }
 
+inline void turnPoseAt(const TurnPlan &p, float s,
+                       float &x, float &y, float &headingDeg, bool &reverse);
+
+/** Furthest distance the maneuver reaches straight ahead of the pass end.
+ *  Turn planning runs only once, so dense sampling is cheap and lets an
+ *  asymmetric rover choose the physically smallest of its two K-turns. */
+inline float turnForwardExtent(const TurnPlan &p) {
+  float extent = 0.0f;
+  for (float s = 0.0f; s < p.lengthFt; s += 0.05f) {
+    float x, y, heading; bool reverse;
+    turnPoseAt(p, s, x, y, heading, reverse);
+    if (y > extent) extent = y;
+  }
+  float x, y, heading; bool reverse;
+  turnPoseAt(p, p.lengthFt, x, y, heading, reverse);
+  return y > extent ? y : extent;
+}
+
 /** Best maneuver for the required sideways shift. A shift big enough to drive
- *  forward round is driven forward round -- each change of direction costs a
- *  pause while the ESC re-arms -- and otherwise the shorter of the two
- *  three-point turns wins. */
+ *  forward round is driven forward round. For an adjacent-lane shift choose
+ *  the three-point turn with the smallest forward/headland extent; path length
+ *  only breaks a tie. */
 inline bool planHeadlandTurn(float shiftFt, float rLeft, float rRight,
                              TurnPlan &p) {
   if (solveForwardUTurn(shiftFt, rLeft, rRight, p)) return true;
@@ -140,7 +158,14 @@ inline bool planHeadlandTurn(float shiftFt, float rLeft, float rRight,
   bool okCcw = solveKTurn(shiftFt, rLeft, rRight, true, ccw);
   bool okCw  = solveKTurn(shiftFt, rLeft, rRight, false, cw);
 
-  if (okCcw && okCw) { p = (ccw.lengthFt <= cw.lengthFt) ? ccw : cw; return true; }
+  if (okCcw && okCw) {
+    const float ccwExtent = turnForwardExtent(ccw);
+    const float cwExtent = turnForwardExtent(cw);
+    p = (ccwExtent < cwExtent ||
+         (fabsf(ccwExtent - cwExtent) < 0.01f && ccw.lengthFt <= cw.lengthFt))
+        ? ccw : cw;
+    return true;
+  }
   if (okCcw) { p = ccw; return true; }
   if (okCw)  { p = cw;  return true; }
 

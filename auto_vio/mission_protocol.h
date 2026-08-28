@@ -63,7 +63,6 @@ class MissionProtocol {
     hasPose_ = false;
     posePending_ = false;
     lastPoseSequence_ = 0;
-    lastPoseAgeMs_ = 0;
     droppedPoses_ = 0;
     fault_ = F_NONE;
     clearCommandCache();
@@ -123,42 +122,12 @@ class MissionProtocol {
         std::fabs(message.yawRateDps) > MAX_YAW_RATE_DPS) {
       return rejectPose(F_POSE_INVALID);
     }
-    if (hasPose_) {
-      // Measure continuity against when the frames were *captured*, not when
-      // their packets happened to land. BLE bunches writes, and an arrival gap
-      // of a millisecond between two frames taken 30 ms apart shrinks every
-      // allowance below the noise it is supposed to tolerate.
-      const float dt = frameIntervalSeconds(message, receivedAtMs);
-      // Every gate below carries an additive floor as well as a rate. A rover
-      // sitting still still reports a small, sign-flipping speed estimate, and
-      // a pure ratio turns that noise into a fault as dt shrinks.
-      const float speedStep = std::fabs(message.speedFps - latestPose_.speedFps);
-      const float allowedSpeedStep = MAX_ACCEL_FPS2 * dt + SPEED_NOISE_FPS;
-      if (speedStep > allowedSpeedStep) {
-        return rejectPose(F_POSE_JUMP, dt, speedStep, allowedSpeedStep);
-      }
-      const float dx = message.x - latestPose_.x;
-      const float dy = message.y - latestPose_.y;
-      const float allowedDistance =
-          std::fmax(std::fabs(message.speedFps), std::fabs(latestPose_.speedFps)) * dt +
-          POSITION_INNOVATION_FT;
-      const float displacement = std::sqrt(dx * dx + dy * dy);
-      if (displacement > allowedDistance) {
-        return rejectPose(F_POSE_JUMP, dt, displacement, allowedDistance);
-      }
-      const float headingDelta = std::fabs(wrappedAngleDiff(
-          message.heading, latestPose_.heading));
-      const float allowedHeading =
-          std::fmax(std::fabs(message.yawRateDps), std::fabs(latestPose_.yawRateDps)) * dt +
-          HEADING_INNOVATION_DEG;
-      if (headingDelta > allowedHeading) {
-        return rejectPose(F_POSE_JUMP, dt, headingDelta, allowedHeading);
-      }
-    }
+    // ARKit can relocalize position, heading, or inferred velocity in one
+    // frame. Accept that discontinuity and keep the control stream alive; pose
+    // jump fault code 4 remains reserved only for wire compatibility.
     if (posePending_) droppedPoses_++;
     latestPose_ = message;
     lastPoseSequence_ = message.sequence;
-    lastPoseAgeMs_ = message.ageMs;
     poseReceivedAtMs_ = receivedAtMs;
     hasPose_ = true;
     posePending_ = true;
@@ -290,12 +259,7 @@ class MissionProtocol {
   static constexpr uint32_t MAX_POSE_AGE_MS = 250;
   static constexpr uint16_t SUPPORTED_CALIBRATION_SCHEMA = 1;
   static constexpr float MAX_SPEED_FPS = 8.0f;
-  static constexpr float MAX_ACCEL_FPS2 = 15.0f;
   static constexpr float MAX_YAW_RATE_DPS = 180.0f;
-  static constexpr float POSITION_INNOVATION_FT = 0.75f;
-  static constexpr float HEADING_INNOVATION_DEG = 5.0f;
-  static constexpr float SPEED_NOISE_FPS = 0.5f;
-  static constexpr float MIN_FRAME_INTERVAL_S = 0.005f;
   static constexpr uint8_t COMMAND_CACHE_CAPACITY = 8;
   struct CommandCacheEntry {
     uint8_t opcode;
@@ -319,7 +283,6 @@ class MissionProtocol {
   bool posePending_ = false;
   protocol_v2::PoseV2 latestPose_ = {};
   uint32_t lastPoseSequence_ = 0;
-  uint32_t lastPoseAgeMs_ = 0;
   uint32_t poseReceivedAtMs_ = 0;
   uint32_t droppedPoses_ = 0;
   PoseRejectDetail lastPoseReject_ = {F_NONE, 0.0f, 0.0f, 0.0f};
@@ -350,23 +313,6 @@ class MissionProtocol {
                   float allowed = 0.0f) {
     lastPoseReject_ = {fault, dtSeconds, measured, allowed};
     return false;
-  }
-
-  // Capture-time gap between this pose and the last accepted one, floored so
-  // two packets that land in the same millisecond stay usable instead of
-  // dividing the allowances down to nothing.
-  float frameIntervalSeconds(
-      const protocol_v2::PoseV2 &message, uint32_t receivedAtMs) const {
-    const int64_t frameMs =
-        static_cast<int64_t>(receivedAtMs) - static_cast<int64_t>(message.ageMs);
-    const int64_t previousFrameMs =
-        static_cast<int64_t>(poseReceivedAtMs_) - static_cast<int64_t>(lastPoseAgeMs_);
-    const float seconds = (frameMs - previousFrameMs) / 1000.0f;
-    return seconds < MIN_FRAME_INTERVAL_S ? MIN_FRAME_INTERVAL_S : seconds;
-  }
-
-  static float wrappedAngleDiff(float a, float b) {
-    return std::fmod(a - b + 540.0f, 360.0f) - 180.0f;
   }
 
   static bool epochIsNewer(uint16_t candidate, uint16_t previous) {

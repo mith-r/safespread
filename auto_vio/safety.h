@@ -16,6 +16,9 @@ enum FaultCode : uint8_t {
   F_NONE = 0,
   F_BLE = 1,
   F_POSE_TIMEOUT = 2,
+  // Reserved for protocol compatibility with older app/firmware builds.
+  // Invalid pose packets are dropped and can only lead to F_POSE_TIMEOUT if
+  // valid tracking does not resume; they never become a mission fault.
   F_POSE_INVALID = 3,
   F_POSE_JUMP = 4,
   F_PWM = 5,
@@ -50,8 +53,8 @@ inline FaultCode evaluateSafety(MissionState state, const SafetyInput &input) {
   if (state == S_IDLE || state == S_COMPLETE || state == S_FAULT) return F_NONE;
   if (!input.bleConnected) return F_BLE;
   if (!input.poseFresh) return F_POSE_TIMEOUT;
-  if (!input.poseValid) return F_POSE_INVALID;
-  if (input.poseJumped) return F_POSE_JUMP;
+  // Pose discontinuities are accepted. Fault 4 remains reserved for protocol
+  // compatibility but is not a runtime safety stop.
   if (!input.pwmReady) return F_PWM;
   if (!input.i2cReady) return F_I2C;
   if (input.stalled) return F_STALL;
@@ -61,6 +64,10 @@ inline FaultCode evaluateSafety(MissionState state, const SafetyInput &input) {
   if (!input.calibrationValid) return F_CALIBRATION;
   if (!input.headlandValid) return F_HEADLAND;
   return F_NONE;
+}
+
+inline bool rejectedPoseRequiresFault(FaultCode fault) {
+  return fault != F_NONE && fault != F_POSE_INVALID && fault != F_POSE_JUMP;
 }
 
 enum MissionEvent : uint8_t {

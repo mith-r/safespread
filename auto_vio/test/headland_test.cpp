@@ -4,10 +4,10 @@
 #include "../headland.h"
 #include "../route.h"
 
-static const float BAR = 17.0f / 12.0f;
-static const float OVERLAP = 0.15f;
-static const float RL = 4.33f;
-static const float RR = 2.92f;
+static const float BAR = 21.0f / 12.0f;
+static const float OVERLAP = 0.0f;
+static const float RL = 5.54f;
+static const float RR = 5.05f;
 static RoutePoint route[6000];
 
 int main() {

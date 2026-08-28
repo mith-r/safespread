@@ -45,21 +45,14 @@ inline bool routeIndexAdvanceIsPossible(uint16_t previous, uint16_t current) {
          static_cast<uint32_t>(current - previous) <= ROUTE_PROGRESS_SEARCH_WINDOW;
 }
 
-// Straight run-up outside the rectangle at each end of a pass. The tracker
-// aims a lookahead ahead of itself, so without this it starts easing into the
-// turn before it has finished the pass and the last stretch goes unsprayed --
-// and it enters the next pass still settling onto the line. The run-up is
-// driven with spray off, so it costs coverage nothing.
-const float HEADLAND_MARGIN_FT = 3.5f;
+// Turn directly at the rectangle edge. Segment-bounded lookahead prevents an
+// early turn, and geometric turn tracking lands aligned on the next lane, so
+// the old 3.5 ft runout only made the rover drive needlessly far away.
+const float HEADLAND_MARGIN_FT = 0.0f;
 
-// Turns are planned a little wider than the rover can actually manage. An arc
-// at exactly the minimum radius needs full lock the whole way round, which
-// leaves nothing in reserve: the tracker cannot pull back in when it drifts
-// wide, because it is already steering as hard as it can. Planning at 1.3x
-// keeps steering off the stop, so drift is correctable in both directions.
-// The cost is a slightly longer turn; the benefit is that the rover exits it
-// on the lane it aimed for rather than a foot or two beside it.
-const float TURN_PLANNING_MARGIN = 1.3f;
+// Use the rover's measured minimum radii. Turn speed is already reduced, and
+// inflating these by 30% was the main source of unnecessarily wide headlands.
+const float TURN_PLANNING_MARGIN = 1.0f;
 const int MAX_FORWARD_LANES = 64;
 
 inline int forwardLaneSkip(float turnRadiusFt, float barWidthFt,
@@ -152,27 +145,44 @@ inline int emitTurn(RoutePoint *out, int maxOut, const TurnPlan &p,
   float ch = cosf(turnRad(h0Deg)), sh = sinf(turnRad(h0Deg));
   int n = 0;
 
-  for (float s = ROUTE_STEP_FT; s < p.lengthFt && n < maxOut; s += ROUTE_STEP_FT) {
-    float lx, ly, lh; bool rev;
-    turnPoseAt(p, s, lx, ly, lh, rev);
-    out[n].x = x0 + lx * ch + ly * sh;
-    out[n].y = y0 - lx * sh + ly * ch;
-    out[n].spray = false;      // never spray through a turn
-    out[n].reverse = rev;
-    out[n].turning = true;
-    out[n].terminal = false;
-    n++;
-  }
-  if (n < maxOut) {
-    float lx, ly, lh; bool rev;
-    turnPoseAt(p, p.lengthFt, lx, ly, lh, rev);
-    out[n].x = x0 + lx * ch + ly * sh;
-    out[n].y = y0 - lx * sh + ly * ch;
-    out[n].spray = false;
-    out[n].reverse = false;    // the turn always finishes driving forward
-    out[n].turning = true;
-    out[n].terminal = false;
-    n++;
+  // Sample each leg independently and always emit its exact endpoint. When a
+  // cusp fell between the old fixed-distance samples, the direction flag
+  // changed at a point up to half a foot before or after the real cusp. The
+  // rover then cut the three-point turn and entered the next pass beside its
+  // intended line. Exact cusp points keep every forward/reverse leg intact.
+  float completed = 0.0f;
+  for (int legIndex = 0; legIndex < p.legCount && n < maxOut; ++legIndex) {
+    const float legLength = turnLegLength(p.leg[legIndex]);
+    if (legLength <= 1e-6f) continue;
+
+    for (float local = ROUTE_STEP_FT;
+         local < legLength - 1e-4f && n < maxOut;
+         local += ROUTE_STEP_FT) {
+      float lx, ly, lh; bool rev;
+      turnPoseAt(p, completed + local, lx, ly, lh, rev);
+      out[n].x = x0 + lx * ch + ly * sh;
+      out[n].y = y0 - lx * sh + ly * ch;
+      out[n].spray = false;
+      out[n].reverse = p.leg[legIndex].reverse;
+      out[n].turning = true;
+      out[n].terminal = false;
+      n++;
+    }
+
+    completed += legLength;
+    if (n < maxOut) {
+      float lx, ly, lh; bool rev;
+      turnPoseAt(p, completed, lx, ly, lh, rev);
+      out[n].x = x0 + lx * ch + ly * sh;
+      out[n].y = y0 - lx * sh + ly * ch;
+      out[n].spray = false;
+      out[n].reverse = (legIndex + 1 < p.legCount)
+          ? p.leg[legIndex].reverse
+          : false;              // leave the completed turn driving forward
+      out[n].turning = true;
+      out[n].terminal = false;
+      n++;
+    }
   }
   return n;
 }

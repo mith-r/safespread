@@ -8,8 +8,8 @@
 // whether passes come out straight or wavy, because a pass is only about ten
 // feet long -- there is no room to settle out an oscillation.
 
-static const float RL = 4.33f;    // measured turning circles
-static const float RR = 2.92f;
+static const float RL = 5.54f;    // measured wet turning circles
+static const float RR = 5.05f;
 static const float MAX_OFFSET = 700.0f;
 
 struct Result {

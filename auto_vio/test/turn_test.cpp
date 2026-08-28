@@ -6,8 +6,8 @@
 // The rover's real, measured circles. They differ by 48% because the steering
 // trim is off-centre, which is exactly the case a single averaged radius gets
 // wrong.
-static const float RL = 4.33f;
-static const float RR = 2.92f;
+static const float RL = 5.54f;
+static const float RR = 5.05f;
 
 // Walk the maneuver and confirm it does what it claims: arrives at the right
 // sideways offset, back on the line it started from, pointing the opposite
@@ -65,10 +65,10 @@ static void checkTurn(float shift, float rLeft, float rRight) {
 
 int main() {
   // --- the shift that actually matters -----------------------------------
-  // One lane over: 17in bar with 15% overlap = 1.204 ft. A plain 180 cannot
+  // One lane over: 21in bar with zero overlap = 1.75 ft. A plain 180 cannot
   // do this at all; it always displaces a full turning diameter.
   {
-    const float LANE = (17.0f / 12.0f) * 0.85f;
+    const float LANE = 21.0f / 12.0f;
     checkTurn(LANE, RL, RR);
     checkTurn(-LANE, RL, RR);
 
@@ -117,8 +117,8 @@ int main() {
   }
 
   // --- asymmetry is actually used ----------------------------------------
-  // With equal radii the two rotation directions cost the same; with the real
-  // unequal ones they do not, and the planner must take the cheaper.
+  // With unequal radii, choose the maneuver that consumes less headland even
+  // when it is not the shortest driving path.
   {
     TurnPlan ccw, cw;
     solveKTurn(1.204f, RL, RR, true, ccw);
@@ -128,10 +128,10 @@ int main() {
 
     TurnPlan chosen;
     planHeadlandTurn(1.204f, RL, RR, chosen);
-    float best = (ccw.lengthFt < cw.lengthFt) ? ccw.lengthFt : cw.lengthFt;
-    assert(fabsf(chosen.lengthFt - best) < 1e-3f);
-    printf("turn_test: same shift costs %.1f ft one way, %.1f ft the other\n",
-           ccw.lengthFt, cw.lengthFt);
+    float bestExtent = fminf(turnForwardExtent(ccw), turnForwardExtent(cw));
+    assert(fabsf(turnForwardExtent(chosen) - bestExtent) < 0.01f);
+    printf("turn_test: same shift reaches %.1f/%.1f ft out; compact choice %.1f ft\n",
+           turnForwardExtent(ccw), turnForwardExtent(cw), bestExtent);
   }
 
   // --- a symmetric rover still works -------------------------------------
@@ -146,7 +146,7 @@ int main() {
   // than the space available the route would run off the plot, so it is worth
   // stating rather than discovering.
   {
-    const float LANE = (17.0f / 12.0f) * 0.85f;
+    const float LANE = 21.0f / 12.0f;
     TurnPlan p;
     planHeadlandTurn(LANE, RL, RR, p);
     float maxY = 0.0f, minY = 0.0f;

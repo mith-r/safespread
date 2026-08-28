@@ -33,6 +33,9 @@ export interface ValidatedPose {
   speedFps: number;
   yawRateDps: number;
   courseDeg: number | null;
+  relocalizationShiftFt: number;
+  accumulatedWorldOffsetXFt: number;
+  accumulatedWorldOffsetYFt: number;
 }
 
 export type PoseDecision =
@@ -135,6 +138,8 @@ export class PosePipeline {
   private lastReceivedAtMs: number | null = null;
   private lastMotionMagnitudeFps = 0;
   private lastAccepted: ValidatedPose | null = null;
+  private worldOffsetXFt = 0;
+  private worldOffsetYFt = 0;
 
   constructor(calibration: MountCalibration) {
     this.calibration = { ...calibration };
@@ -148,6 +153,8 @@ export class PosePipeline {
     this.lastReceivedAtMs = null;
     this.lastMotionMagnitudeFps = 0;
     this.lastAccepted = null;
+    this.worldOffsetXFt = 0;
+    this.worldOffsetYFt = 0;
   }
 
   ingest(event: PoseUpdatePayload, receivedAtMs: number): PoseDecision {
@@ -172,9 +179,45 @@ export class PosePipeline {
     const captureAgeMs = event.emittedTimestampMs - event.frameTimestampMs;
     if (captureAgeMs > MAX_CAPTURE_AGE_MS) return this.reject('age');
 
-    const camera = { x: event.x, y: event.y, heading: normalizeHeading(event.heading) };
-    const rover = cameraToRover(camera, this.calibration);
-    const sprayBar = roverToSprayBar(rover, this.calibration);
+    let camera = {
+      x: event.x + this.worldOffsetXFt,
+      y: event.y + this.worldOffsetYFt,
+      heading: normalizeHeading(event.heading),
+    };
+    let rover = cameraToRover(camera, this.calibration);
+    let sprayBar = roverToSprayBar(rover, this.calibration);
+    let relocalizationShiftFt = 0;
+
+    if (this.lastAccepted) {
+      const seconds = Math.max(
+        (event.frameTimestampMs - this.lastAccepted.frameTimestampMs) / 1000,
+        MIN_FRAME_INTERVAL_S,
+      );
+      const displacement = Math.hypot(
+        rover.x - this.lastAccepted.rover.x,
+        rover.y - this.lastAccepted.rover.y,
+      );
+      const allowed = INNOVATION_ALLOWANCE_FT + this.lastMotionMagnitudeFps * seconds;
+      if (displacement > allowed) {
+        // ARKit can translate its world origin while continuing to report
+        // normal tracking. Treat movement beyond the rover's physical budget
+        // as a coordinate-frame correction: absorb it into a persistent world
+        // offset and keep the emitted rover pose continuous.
+        const correctionX = this.lastAccepted.rover.x - rover.x;
+        const correctionY = this.lastAccepted.rover.y - rover.y;
+        this.worldOffsetXFt += correctionX;
+        this.worldOffsetYFt += correctionY;
+        relocalizationShiftFt = Math.hypot(correctionX, correctionY);
+        camera = {
+          ...camera,
+          x: camera.x + correctionX,
+          y: camera.y + correctionY,
+        };
+        rover = cameraToRover(camera, this.calibration);
+        sprayBar = roverToSprayBar(rover, this.calibration);
+      }
+    }
+
     const candidates = [...this.motionSamples, { frameTimestampMs: event.frameTimestampMs, rover }]
       .slice(-MOTION_SAMPLE_LIMIT);
     const motion = estimateMotion(candidates);
@@ -196,9 +239,6 @@ export class PosePipeline {
         return this.reject('acceleration');
       }
 
-      const displacement = Math.hypot(rover.x - this.lastAccepted.rover.x, rover.y - this.lastAccepted.rover.y);
-      const allowed = INNOVATION_ALLOWANCE_FT + this.lastMotionMagnitudeFps * seconds;
-      if (displacement > allowed) return this.reject('innovation');
     }
 
     const forwardX = Math.sin((rover.heading * Math.PI) / 180);
@@ -218,6 +258,9 @@ export class PosePipeline {
       speedFps,
       yawRateDps: motion.yawRateDps,
       courseDeg,
+      relocalizationShiftFt,
+      accumulatedWorldOffsetXFt: this.worldOffsetXFt,
+      accumulatedWorldOffsetYFt: this.worldOffsetYFt,
     };
 
     this.motionSamples = candidates;

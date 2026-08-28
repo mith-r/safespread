@@ -26,7 +26,6 @@ export interface CalibrationFormValue {
 interface SetupWizardProps {
   state: SetupState;
   roverPose: Pose | null;
-  cameraPose: Pose | null;
   trackingDetail: string;
   readinessReason: string;
   calibration: CalibrationRecord | null;
@@ -126,10 +125,10 @@ function RectanglePreview({ state }: { state: SetupState }) {
 
 export default function SetupWizard(props: SetupWizardProps) {
   const { state } = props;
-  const [mText, setMText] = useState('21.9');
-  const [nText, setNText] = useState('21.9');
-  const [startClearText, setStartClearText] = useState('18.5');
-  const [endClearText, setEndClearText] = useState('11.3');
+  const [mText, setMText] = useState('40');
+  const [nText, setNText] = useState('12');
+  const [startClearText, setStartClearText] = useState('8');
+  const [endClearText, setEndClearText] = useState('8');
   const [side, setSide] = useState<'right' | 'left'>('right');
   const [cameraForward, setCameraForward] = useState(String(DEFAULT_MOUNT_CALIBRATION.cameraForwardFt));
   const [cameraRight, setCameraRight] = useState(String(DEFAULT_MOUNT_CALIBRATION.cameraRightFt));
@@ -157,17 +156,6 @@ export default function SetupWizard(props: SetupWizardProps) {
       mFt: numberValue(mText),
       nFt: numberValue(nText),
       side,
-      startClearFt: numberValue(startClearText),
-      endClearFt: numberValue(endClearText),
-    });
-  };
-
-  const captureB = () => {
-    if (!props.cameraPose) return;
-    props.dispatch({
-      type: 'CAPTURE_CORNER_B',
-      pose: props.cameraPose,
-      stable: state.readiness.poseStable && state.readiness.trackingNormal,
       startClearFt: numberValue(startClearText),
       endClearFt: numberValue(endClearText),
     });
@@ -228,43 +216,16 @@ export default function SetupWizard(props: SetupWizardProps) {
         {state.phase === 'rectangle' ? (
           <View style={styles.card}>
             <Text style={styles.cardTitle}>2. Rectangle</Text>
+            <Text style={styles.help}>At the start corner, point the mounted phone top along M. Passes run along M.</Text>
             <View style={styles.row}>
-              <Choice active={state.rectangleMode === 'entered'} label="Enter M × N" onPress={() => props.dispatch({ type: 'SELECT_RECTANGLE_MODE', mode: 'entered' })} />
-              <Choice active={state.rectangleMode === 'walked'} label="Walk corners" onPress={() => props.dispatch({ type: 'SELECT_RECTANGLE_MODE', mode: 'walked' })} />
+              <Field label="M length (ft)" value={mText} onChange={setMText} />
+              <Field label="N width (ft)" value={nText} onChange={setNText} />
             </View>
-
-            {state.rectangleMode === 'entered' ? (
-              <>
-                <Text style={styles.help}>At the start corner, point the mounted phone top along M. Passes run along M.</Text>
-                <View style={styles.row}>
-                  <Field label="M length (ft)" value={mText} onChange={setMText} />
-                  <Field label="N width (ft)" value={nText} onChange={setNText} />
-                </View>
-                <View style={styles.row}>
-                  <Choice active={side === 'right'} label="Cover right" onPress={() => setSide('right')} />
-                  <Choice active={side === 'left'} label="Cover left" onPress={() => setSide('left')} />
-                </View>
-                <Button label="Set rectangle at rover" disabled={!props.roverPose || !state.readiness.poseStable} onPress={setEntered} />
-              </>
-            ) : null}
-
-            {state.rectangleMode === 'walked' ? (
-              <>
-                <Text style={styles.help}>Remove the phone, stand at A, and point its top along M. Then walk directly to opposite corner B.</Text>
-                <View style={styles.row}>
-                  <Button
-                    label={state.cornerA ? 'Corner A set' : 'Set Corner A'}
-                    disabled={!props.cameraPose || !state.readiness.poseStable}
-                    onPress={() => props.cameraPose && props.dispatch({
-                      type: 'CAPTURE_CORNER_A',
-                      pose: props.cameraPose,
-                      stable: state.readiness.poseStable && state.readiness.trackingNormal,
-                    })}
-                  />
-                  <Button label="Set opposite B" disabled={!state.cornerA || !props.cameraPose || !state.readiness.poseStable} onPress={captureB} />
-                </View>
-              </>
-            ) : null}
+            <View style={styles.row}>
+              <Choice active={side === 'right'} label="Cover right" onPress={() => setSide('right')} />
+              <Choice active={side === 'left'} label="Cover left" onPress={() => setSide('left')} />
+            </View>
+            <Button label="Set rectangle at rover" disabled={!props.roverPose || !state.readiness.poseStable} onPress={setEntered} />
 
             {state.rectangle?.side === 'left' && !state.coverageSideConfirmed ? (
               <Button label="Use LEFT coverage (flip)" tone="secondary" onPress={() => props.dispatch({ type: 'CONFIRM_COVERAGE_SIDE' })} />
@@ -294,13 +255,12 @@ export default function SetupWizard(props: SetupWizardProps) {
                 along it — the rover checks the spot itself and refuses to arm until it is there.
               </Text>
             ) : (
-              <Text style={styles.check}>{state.readiness.atStart ? '✓' : '○'} Rover at rectangle start{state.rectangleMode === 'walked' ? ' / Corner A' : ''}</Text>
+              <Text style={styles.check}>{state.readiness.atStart ? '✓' : '○'} Rover at rectangle start</Text>
             )}
             <Text style={styles.check}>
-              {state.calibrationStatus === 'ready' ? '✓' : state.wet ? '✕' : '△'} Calibration {state.calibrationStatus}
-              {state.calibrationStatus !== 'ready' ? ' — open Diagnostics to calibrate' : ''}
+              {state.calibrationStatus === 'ready' ? '✓ Saved calibration available' : '△ Calibration optional — using built-in rover settings'}
             </Text>
-            <Text style={styles.check}>{state.loggingReady ? '✓ Mission log ready' : state.wet ? '✕ Mission log required for wet use' : '△ Dry run may continue without a log'}</Text>
+            <Text style={styles.check}>{state.loggingReady ? '✓ Mission log ready' : '△ Mission log unavailable; operation may continue'}</Text>
             {state.phase === 'readiness' ? <Button label="Configure and Arm" disabled={props.busy} onPress={() => void props.onArm()} /> : null}
             {state.phase === 'arming' ? <Text style={styles.waiting}>Waiting for Arm acknowledgement…</Text> : null}
             {state.phase === 'armed' ? <Button label="Start mission" disabled={props.busy} onPress={() => void props.onStart()} /> : null}
