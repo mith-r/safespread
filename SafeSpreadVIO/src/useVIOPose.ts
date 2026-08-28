@@ -9,15 +9,45 @@ import {
 } from '../modules/arkit-pose/src/ArkitPose.types';
 import { DEFAULT_MOUNT_CALIBRATION } from './hardwareGeometry';
 import { MountCalibration } from './poseMath';
-import { PoseDecision, PosePipeline, PoseReadiness, ValidatedPose } from './posePipeline';
+import {
+  PoseDecision,
+  PosePipeline,
+  PoseReadiness,
+  PoseRejectReason,
+  ValidatedPose,
+} from './posePipeline';
 
 export { DEFAULT_MOUNT_CALIBRATION } from './hardwareGeometry';
+
+// A pose the pipeline refused never reaches the rover, which sees only silence
+// and calls it a pose timeout 250 ms later. Report the refusal itself so the
+// two are told apart.
+export interface PoseRejection {
+  reason: PoseRejectReason;
+  sequence: number;
+  frameTimestampMs: number;
+  trackingState: TrackingState;
+  trackingReason: TrackingReason;
+  count: number;
+  total: number;
+}
+
+export interface PoseRejectSummary {
+  total: number;
+  counts: Partial<Record<PoseRejectReason, number>>;
+  lastReason: PoseRejectReason | null;
+}
+
+const EMPTY_REJECT_SUMMARY: PoseRejectSummary = { total: 0, counts: {}, lastReason: null };
 
 function monotonicNow(): number {
   return globalThis.performance?.now() ?? Date.now();
 }
 
-export function useVIOPose(calibration: MountCalibration = DEFAULT_MOUNT_CALIBRATION) {
+export function useVIOPose(
+  calibration: MountCalibration = DEFAULT_MOUNT_CALIBRATION,
+  onReject?: (rejection: PoseRejection) => void,
+) {
   const pipeline = useMemo(
     () => new PosePipeline(calibration),
     [
@@ -41,7 +71,12 @@ export function useVIOPose(calibration: MountCalibration = DEFAULT_MOUNT_CALIBRA
   const [mappingStatus, setMappingStatus] = useState<MappingStatus>('notAvailable');
   const [readiness, setReadiness] = useState<PoseReadiness>({ ready: false, reason: 'noSamples' });
   const [fresh, setFresh] = useState(false);
+  const [rejectSummary, setRejectSummary] = useState<PoseRejectSummary>(EMPTY_REJECT_SUMMARY);
   const latestPoseRef = useRef<ValidatedPose | null>(null);
+  const rejectCountsRef = useRef<Partial<Record<PoseRejectReason, number>>>({});
+  const rejectTotalRef = useRef(0);
+  const onRejectRef = useRef(onReject);
+  onRejectRef.current = onReject;
 
   useEffect(() => {
     ArkitPoseModule.start();
@@ -59,6 +94,23 @@ export function useVIOPose(calibration: MountCalibration = DEFAULT_MOUNT_CALIBRA
         setFresh(true);
       } else {
         setFresh(false);
+        const count = (rejectCountsRef.current[decision.reason] ?? 0) + 1;
+        rejectCountsRef.current = { ...rejectCountsRef.current, [decision.reason]: count };
+        rejectTotalRef.current += 1;
+        setRejectSummary({
+          total: rejectTotalRef.current,
+          counts: rejectCountsRef.current,
+          lastReason: decision.reason,
+        });
+        onRejectRef.current?.({
+          reason: decision.reason,
+          sequence: event.sequence,
+          frameTimestampMs: event.frameTimestampMs,
+          trackingState: event.trackingState,
+          trackingReason: event.trackingReason,
+          count,
+          total: rejectTotalRef.current,
+        });
       }
       setReadiness(pipeline.readiness(receivedAtMs));
     });
@@ -67,6 +119,9 @@ export function useVIOPose(calibration: MountCalibration = DEFAULT_MOUNT_CALIBRA
       ArkitPoseModule.stop();
       pipeline.reset();
       latestPoseRef.current = null;
+      rejectCountsRef.current = {};
+      rejectTotalRef.current = 0;
+      setRejectSummary(EMPTY_REJECT_SUMMARY);
     };
   }, [pipeline]);
 
@@ -90,5 +145,6 @@ export function useVIOPose(calibration: MountCalibration = DEFAULT_MOUNT_CALIBRA
     mappingStatus,
     trackingOk: fresh && isPoseUsable(trackingState) && latestDecision.ok,
     readiness,
+    rejectSummary,
   };
 }

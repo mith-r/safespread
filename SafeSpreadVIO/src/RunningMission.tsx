@@ -18,7 +18,10 @@ interface RunningMissionProps {
   logName: string | null;
   faultDumpReady: boolean;
   busy: boolean;
+  /** Sprayed pass the rover was driving, counted in route order from zero. */
+  currentPassIndex: number;
   onStop(): Promise<void>;
+  onResume(passIndex: number): Promise<void>;
   onDownloadFault(): Promise<void>;
 }
 
@@ -31,7 +34,12 @@ function stateLabel(phase: SetupPhase): string {
 
 export default function RunningMission(props: RunningMissionProps) {
   const [mapOpen, setMapOpen] = useState(false);
+  const [resumePass, setResumePass] = useState<number | null>(null);
   const telemetry = props.telemetry;
+  // Default to the pass that was interrupted: it was cut short, so it is the
+  // one that still needs covering.
+  const pass = resumePass ?? props.currentPassIndex;
+  const stopped = props.phase === 'fault' || props.phase === 'complete';
   const spraying = Boolean(telemetry && (telemetry.flags & 1));
   return (
     <View style={[styles.screen, spraying && styles.spraying]}>
@@ -82,6 +90,46 @@ export default function RunningMission(props: RunningMissionProps) {
         </View>
       ) : null}
 
+      {stopped ? (
+        <View style={styles.card}>
+          <Text style={styles.cardTitle}>Resume</Text>
+          <Text style={styles.detail}>
+            Keeps this rectangle and starts again on the pass you choose, so the passes
+            already laid down are not re-sprayed. The rover refuses to arm until it is
+            standing on that pass.
+          </Text>
+          <View style={styles.resumeRow}>
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="Earlier pass"
+              disabled={props.busy || pass <= 0}
+              onPress={() => setResumePass(Math.max(0, pass - 1))}
+              style={({ pressed }) => [styles.step, (props.busy || pass <= 0) && styles.disabled, pressed && styles.pressed]}
+            >
+              <Text style={styles.buttonText}>−</Text>
+            </Pressable>
+            <Text style={styles.metric}>Pass {pass + 1}</Text>
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="Later pass"
+              disabled={props.busy}
+              onPress={() => setResumePass(pass + 1)}
+              style={({ pressed }) => [styles.step, props.busy && styles.disabled, pressed && styles.pressed]}
+            >
+              <Text style={styles.buttonText}>+</Text>
+            </Pressable>
+          </View>
+          <Pressable
+            accessibilityRole="button"
+            disabled={props.busy}
+            onPress={() => void props.onResume(pass)}
+            style={({ pressed }) => [styles.mapButton, props.busy && styles.disabled, pressed && styles.pressed]}
+          >
+            <Text style={styles.buttonText}>Stop and resume from pass {pass + 1}</Text>
+          </Pressable>
+        </View>
+      ) : null}
+
       <View style={styles.bottomRow}>
         <Pressable onPress={() => setMapOpen(true)} style={({ pressed }) => [styles.mapButton, pressed && styles.pressed]}>
           <Text style={styles.buttonText}>Mission map</Text>
@@ -114,6 +162,8 @@ const styles = StyleSheet.create({
   faultTitle: { color: '#ff8a80', fontSize: 19, fontWeight: '900' },
   faultText: { color: 'white', fontSize: 16, lineHeight: 22 },
   download: { backgroundColor: '#455a64', borderRadius: 8, padding: 12, alignItems: 'center' },
+  resumeRow: { flexDirection: 'row', alignItems: 'center', gap: 16 },
+  step: { backgroundColor: '#37474f', borderRadius: 8, paddingVertical: 10, paddingHorizontal: 20 },
   bottomRow: { marginTop: 'auto', gap: 8 },
   mapButton: { backgroundColor: '#1565c0', borderRadius: 8, padding: 13, alignItems: 'center' },
   buttonText: { color: 'white', fontWeight: '700' },

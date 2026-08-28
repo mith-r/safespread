@@ -1,6 +1,8 @@
 import { crc16Ccitt } from './protocolV2';
 import {
   CalibrationWire,
+  FAULT_START_POINT,
+  MissionCommandRefused,
   MissionControl,
   MissionTransport,
 } from './missionControl';
@@ -23,13 +25,13 @@ const calibration: CalibrationWire = {
   sprayRightFt: 0,
 };
 
-function ack(epoch: number, commandId: number, state: number, calibrationId = 3) {
+function ack(epoch: number, commandId: number, state: number, calibrationId = 3, faultCode = 0) {
   const bytes = new Uint8Array(16);
   const view = new DataView(bytes.buffer);
   bytes.set([0x21, 0x41, 2, state]);
   view.setUint16(4, epoch, true);
   view.setUint32(6, commandId, true);
-  view.setUint16(10, 0, true);
+  view.setUint16(10, faultCode, true);
   view.setUint16(12, calibrationId, true);
   view.setUint16(14, crc16Ccitt(bytes.subarray(0, 14)), true);
   return bytes;
@@ -70,6 +72,46 @@ async function configuredControl(transport: FakeTransport, fresh = () => true) {
   await control.configure(rectangle, calibration);
   return control;
 }
+
+describe('MissionControl resume', () => {
+  it('sends the chosen pass in the rectangle packet, and zero by default', async () => {
+    const transport = new FakeTransport();
+    autoAckConfiguration(transport);
+    const control = new MissionControl(transport, 7, () => true, { timeoutMs: 5, retries: 2 });
+    await control.configure(rectangle, calibration, 5);
+    const resumed = transport.writes.find((packet) => packet[1] === 0x44)!;
+    expect(new DataView(resumed.buffer, resumed.byteOffset).getUint16(28, true)).toBe(5);
+
+    const fresh = new FakeTransport();
+    await configuredControl(fresh);
+    const fromStart = fresh.writes.find((packet) => packet[1] === 0x44)!;
+    expect(new DataView(fromStart.buffer, fromStart.byteOffset).getUint16(28, true)).toBe(0);
+  });
+});
+
+describe('MissionControl arm refusal', () => {
+  it('keeps the mission configured when the rover refuses the resume start', async () => {
+    const transport = new FakeTransport();
+    const control = await configuredControl(transport);
+    // First Arm: the rover is not standing on the resumed pass.
+    transport.onWrite = (packet) => transport.emit(ack(7, packetId(packet), 1, 3, FAULT_START_POINT));
+    await expect(control.arm()).rejects.toBeInstanceOf(MissionCommandRefused);
+    expect(control.state).toBe('configured');
+
+    // The operator moves the rover and arms again on the same mission.
+    transport.onWrite = (packet) => transport.emit(ack(7, packetId(packet), 2));
+    await control.arm();
+    expect(control.state).toBe('armed');
+  });
+
+  it('still treats any other Arm fault as a mission fault', async () => {
+    const transport = new FakeTransport();
+    const control = await configuredControl(transport);
+    transport.onWrite = (packet) => transport.emit(ack(7, packetId(packet), 1, 3, 5));
+    await expect(control.arm()).rejects.toThrow(/firmware fault 5/);
+    expect(control.state).toBe('fault');
+  });
+});
 
 describe('MissionControl ordering and acknowledgements', () => {
   it('requires configure, a fresh pose, arm, then start', async () => {

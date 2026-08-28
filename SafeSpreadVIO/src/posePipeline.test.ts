@@ -137,7 +137,7 @@ describe('PosePipeline drive rejection', () => {
     const acceleration = new PosePipeline({ ...calibration, cameraForwardFt: 0 });
     accepted(acceleration, poseEvent(1, 0, { y: 0 }), 1000);
     accepted(acceleration, poseEvent(2, 100, { y: 0.1 }), 1100);
-    expect(acceleration.ingest(poseEvent(3, 200, { y: 0.6 }), 1200)).toEqual({
+    expect(acceleration.ingest(poseEvent(3, 200, { y: 1 }), 1200)).toEqual({
       ok: false,
       reason: 'acceleration',
     });
@@ -155,6 +155,40 @@ describe('PosePipeline drive rejection', () => {
       ok: false,
       reason: 'innovation',
     });
+  });
+});
+
+describe('PosePipeline standstill noise', () => {
+  // A parked rover still produces a jittering velocity estimate. Dividing that
+  // jitter by a 16 ms frame interval used to clear the acceleration limit and
+  // stop the pose stream, which the rover then reported as a pose timeout.
+  it('accepts a stationary stream carrying position noise at frame rate', () => {
+    const pipeline = new PosePipeline({ ...calibration, cameraForwardFt: 0 });
+    for (let index = 0; index < 200; index += 1) {
+      const timestamp = index * 16;
+      const result = pipeline.ingest(
+        poseEvent(index + 1, timestamp, {
+          x: index % 2 ? 0.008 : -0.008,
+          y: index % 2 ? 0.994 : 1.006,
+          heading: index % 2 ? 0.3 : 359.7,
+        }),
+        10_000 + timestamp,
+      );
+      expect(result).toEqual(expect.objectContaining({ ok: true }));
+      if (result.ok) expect(result.pose.speedFps).toBe(0);
+    }
+  });
+
+  it('keeps the arming window through a motion-gate rejection', () => {
+    const pipeline = new PosePipeline(calibration);
+    const lastReceived = fillStationaryWindow(pipeline);
+    expect(pipeline.readiness(lastReceived).ready).toBe(true);
+
+    // One relocalisation snap is a hiccup, not a loss of tracking: it must not
+    // cost the operator the two seconds of stillness already banked.
+    expect(pipeline.ingest(poseEvent(40, 2100, { x: 6 }), lastReceived + 34))
+      .toEqual({ ok: false, reason: 'innovation' });
+    expect(pipeline.readiness(lastReceived + 34).ready).toBe(true);
   });
 });
 

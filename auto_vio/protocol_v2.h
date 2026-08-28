@@ -40,6 +40,11 @@ struct RectangleV2 {
   float startClearFt;
   float endClearFt;
   uint16_t calibrationId;
+  // Sprayed pass to begin on, counted in route order from zero. A fault used
+  // to cost the whole rectangle because every restart began at pass zero;
+  // this lets the operator re-drive only what is left. Zero is the old
+  // behaviour, so an unset field means "from the start".
+  uint16_t startPassIndex;
 };
 
 struct CalibrationV2 {
@@ -244,13 +249,13 @@ inline bool buildRectangleV2(const RectangleV2 &value, uint8_t *out, size_t size
   detail::writeFloat(bytes, 18, value.startClearFt);
   detail::writeFloat(bytes, 22, value.endClearFt);
   detail::writeU16(bytes, 26, value.calibrationId);
+  detail::writeU16(bytes, 28, value.startPassIndex);
   detail::finish(bytes, sizeof(bytes));
   return detail::copyOut(bytes, sizeof(bytes), out, size);
 }
 
 inline bool parseRectangleV2(const uint8_t *bytes, size_t size, RectangleV2 &out) {
-  if (!detail::valid(bytes, size, RECTANGLE_SIZE, 0x44) || bytes[3] > 7 ||
-      bytes[28] != 0 || bytes[29] != 0) return false;
+  if (!detail::valid(bytes, size, RECTANGLE_SIZE, 0x44) || bytes[3] > 7) return false;
   RectangleV2 parsed = {};
   parsed.flags = bytes[3];
   parsed.epoch = detail::readU16(bytes, 4);
@@ -260,6 +265,7 @@ inline bool parseRectangleV2(const uint8_t *bytes, size_t size, RectangleV2 &out
   parsed.startClearFt = detail::readFloat(bytes, 18);
   parsed.endClearFt = detail::readFloat(bytes, 22);
   parsed.calibrationId = detail::readU16(bytes, 26);
+  parsed.startPassIndex = detail::readU16(bytes, 28);
   if (!std::isfinite(parsed.mFt) || parsed.mFt <= 0.0f ||
       !std::isfinite(parsed.nFt) || parsed.nFt <= 0.0f ||
       !std::isfinite(parsed.startClearFt) || parsed.startClearFt < 0.0f ||

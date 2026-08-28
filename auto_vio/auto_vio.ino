@@ -134,6 +134,11 @@ unsigned long lastVioTime = 0;
 unsigned long lastTelemetryTime = 0;
 unsigned long packetCount = 0;
 uint32_t invalidPacketCount = 0;
+// A silent pose stream and a rejected pose stream look identical from the
+// rover's telemetry, and they have opposite fixes. Count every rejection by
+// cause and say so out loud, slowly enough not to flood the BLE link.
+uint16_t poseRejectCounts[F_HEADLAND + 1] = {};
+unsigned long lastPoseRejectLogMs = 0;
 volatile uint16_t queueOverflowCount = 0;
 bool dryRunMode  = false;
 bool sprayActive = false;
@@ -218,13 +223,28 @@ bool reverseCalibrationVerified = false;
 bool calibrationActive = false;
 
 const int MAX_ROUTE_POINTS = 6000;
-RoutePoint route[MAX_ROUTE_POINTS];
+// The plan is 70 KB -- by far the largest thing this firmware owns. Held
+// statically it does not fit alongside the BLE stack in the ESP32's DRAM
+// segment, so it is taken from the heap once at boot, before Bluedroid claims
+// its share. A rover that cannot get it says so and refuses to plan, rather
+// than planning into a null pointer.
+RoutePoint *route = nullptr;
 int routeCount = 0;
 int routeIndex = 0;
+// Where this mission begins in the plan. Normally zero; on a resume it is the
+// first point of the pass the operator chose, so a fault costs the passes that
+// are left rather than the whole rectangle.
+int routeStartIndex = 0;
 int firstPassEnd = 0;      // route index where the all-important first pass ends
 RouteStyle routeStyle = ROUTE_NONE;
 RouteRequirements routeRequirements = {};
 FaultCode routePlanningFault = F_ROUTE;
+
+// How close the rover must be to a resumed pass before it may arm. Wider than
+// the app's start check, because the operator is aiming at a lane in the middle
+// of the rectangle by eye rather than at a marked corner.
+const float RESUME_POSITION_TOLERANCE_FT = 1.5f;
+const float RESUME_HEADING_TOLERANCE_DEG = 12.0f;
 
 // Steer at a point this far ahead on the path. On a straight pass a long
 // lookahead tracks smoothly; through a turn it must be shorter than the arc's
@@ -1201,6 +1221,14 @@ float curvatureForCommand(float rightward) {
 }
 
 void planRoute() {
+  if (route == nullptr) {
+    routeCount = 0;
+    routeStyle = ROUTE_NONE;
+    routeRequirements = {};
+    routePlanningFault = F_ROUTE;
+    bleLog("!! No route memory was available at boot; this rover cannot plan a mission.");
+    return;
+  }
   const protocol_v2::RectangleV2 &rectangle = mission.rectangle();
   const bool preferForwardOnly = (rectangle.flags & 0x04) != 0;
   const RouteSelection selection = selectRoute(
@@ -1214,7 +1242,25 @@ void planRoute() {
   routePlanningFault = routeStyle == ROUTE_NONE
       ? (routeRequirements.truncated ? F_ROUTE : F_HEADLAND)
       : F_NONE;
-  routeIndex = 0;
+
+  // A resume asks to skip the passes already laid down. Refuse a pass the plan
+  // does not contain rather than silently starting from the beginning, which
+  // would re-spray ground the operator believes is finished.
+  routeStartIndex = 0;
+  if (routeCount > 0 && rectangle.startPassIndex > 0) {
+    const int start = routePassStartIndex(route, routeCount,
+                                          static_cast<int>(rectangle.startPassIndex));
+    if (start < 0) {
+      bleLog("!! Resume pass " + String(rectangle.startPassIndex + 1) + " is past the end of this plan (" +
+             String(routePassCount(route, routeCount)) + " passes).");
+      routeCount = 0;
+      routeStyle = ROUTE_NONE;
+      routePlanningFault = F_ROUTE;
+    } else {
+      routeStartIndex = start;
+    }
+  }
+  routeIndex = routeStartIndex;
   lastRouteIndex = -1;
   targetDistanceValid = false;
   sprayInhibited = false;
@@ -1255,6 +1301,17 @@ void planRoute() {
          " ft past the far end, " + String(routeRequirements.beforeStartFt, 1) +
          " ft behind the start.");
 
+  // The app cannot compute where a resumed pass begins -- forward-only plans
+  // visit lanes out of order -- so the rover states it, and the app holds the
+  // operator to that spot before it will arm.
+  if (routeCount > 0) {
+    bleLog("[RESUME] pass=" + String(routePassIndexAt(route, routeCount, routeStartIndex) + 1) +
+           "/" + String(routePassCount(route, routeCount)) +
+           " x=" + String(route[routeStartIndex].x, 2) +
+           " y=" + String(route[routeStartIndex].y, 2) +
+           " hdg=" + String(segmentHeadingDeg(route, routeCount, routeStartIndex), 1));
+  }
+
   if (routeStyle == ROUTE_NONE && routePlanningFault == F_HEADLAND) {
     bleLog("!! Neither forward-only nor three-point turns fit the entered clear pavement.");
   }
@@ -1262,6 +1319,29 @@ void planRoute() {
   if (routeRequirements.truncated) {
     bleLog("!! Route hit the point limit; area is too large to plan fully.");
   }
+}
+
+// Whether the rover is standing where the plan starts. Only meaningful for a
+// resumed mission: for a full rectangle the plan starts under the rover by
+// construction, and the app has already checked it against the rectangle.
+bool atRouteStart() {
+  if (routeStartIndex <= 0 || routeStartIndex >= routeCount) return true;
+  const float dx = route[routeStartIndex].x - robotX_ft;
+  const float dy = route[routeStartIndex].y - robotY_ft;
+  const float distance = sqrtf(dx * dx + dy * dy);
+  const float headingError = fabsf(angleDiffDeg(
+      segmentHeadingDeg(route, routeCount, routeStartIndex), robotHeading));
+  const bool reached = distance <= RESUME_POSITION_TOLERANCE_FT &&
+                       headingError <= RESUME_HEADING_TOLERANCE_DEG;
+  if (!reached) {
+    bleLog("!! Resume start is " + String(distance, 1) + " ft and " +
+           String(headingError, 0) + " deg away. Move to x=" +
+           String(route[routeStartIndex].x, 2) + " y=" +
+           String(route[routeStartIndex].y, 2) + " hdg=" +
+           String(segmentHeadingDeg(route, routeCount, routeStartIndex), 0) +
+           " and arm again.");
+  }
+  return reached;
 }
 
 void updateSpray() {
@@ -1480,6 +1560,24 @@ void runFollow() {
 static uint8_t acc[64];
 static size_t  accLen = 0;
 
+// Which gate refused the pose, and by how much. The numbers matter: a jump
+// caused by 0.2 ft/s of standstill noise and a jump caused by a four-foot
+// relocalisation snap need different answers.
+void notePoseReject(const PoseRejectDetail &detail) {
+  const uint8_t code = static_cast<uint8_t>(detail.fault);
+  if (code <= F_HEADLAND && poseRejectCounts[code] < 0xffff) poseRejectCounts[code]++;
+  if (millis() - lastPoseRejectLogMs < 500) return;
+  lastPoseRejectLogMs = millis();
+  String line = "[POSE REJ] code=" + String(code) +
+                " n=" + String(code <= F_HEADLAND ? poseRejectCounts[code] : 0);
+  if (detail.fault == F_POSE_JUMP) {
+    line += " dt=" + String(detail.dtSeconds * 1000.0f, 1) + "ms" +
+            " got=" + String(detail.measured, 3) +
+            " max=" + String(detail.allowed, 3);
+  }
+  bleLog(line);
+}
+
 void feed(const uint8_t *d, size_t n, uint32_t receivedAtMs) {
   if (d == nullptr || n == 0) return;
 
@@ -1496,6 +1594,7 @@ void feed(const uint8_t *d, size_t n, uint32_t receivedAtMs) {
         }
       } else if (!mission.acceptPose(pose, receivedAtMs)) {
         invalidPacketCount++;
+        notePoseReject(mission.lastPoseReject());
         if (mission.state() == S_ARMED || mission.state() == S_RUNNING) {
           FaultCode fault = mission.lastPoseRejectFault();
           enterFault(fault == F_NONE ? F_POSE_INVALID : fault);
@@ -1562,6 +1661,7 @@ void feed(const uint8_t *d, size_t n, uint32_t receivedAtMs) {
         const bool ready = ensurePwmReady();
         mission.setPwmReady(ready);
       }
+      if (command.opcode == 1) mission.setStartPointReached(atRouteStart());
 
       protocol_v2::AckV2 ack = mission.acceptCommand(
           command, receivedAtMs, calibrationOpcode && dryRunMode);
@@ -1586,7 +1686,7 @@ void feed(const uint8_t *d, size_t n, uint32_t receivedAtMs) {
           ack.state = static_cast<uint8_t>(mission.state());
           ack.faultCode = F_ROUTE;
         } else {
-          routeIndex = 0;
+          routeIndex = routeStartIndex;
           lastRouteIndex = -1;
           routeIndexSince = millis();
           resetCourse();
@@ -1639,6 +1739,9 @@ void feed(const uint8_t *d, size_t n, uint32_t receivedAtMs) {
         dryRunMode = !dryRunMode;
         setSpray(false);
         bleLog(dryRunMode ? "[MODE] DRY" : "[MODE] WET");
+    if (route == nullptr) {
+      bleLog("!! No route memory was available at boot; this rover cannot run a mission.");
+    }
       } else {
         bleLog("!! Mode change refused: Stop first.");
       }
@@ -1747,6 +1850,13 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
 
+  // Before anything else allocates: this is the one block that needs a large
+  // contiguous run of DRAM, and the BLE stack fragments what is left.
+  route = static_cast<RoutePoint *>(calloc(MAX_ROUTE_POINTS, sizeof(RoutePoint)));
+  if (route == nullptr) {
+    Serial.println("FATAL: could not allocate the route buffer; missions are unavailable.");
+  }
+
   steeringMapValid = validSteeringMap(steeringMap, steeringMapCount);
   hasStoredMotionCalibration = calibrationPersistence.load(storedMotionCalibration);
   if (hasStoredMotionCalibration) applyMotionCalibration(storedMotionCalibration);
@@ -1837,6 +1947,10 @@ void loop() {
            " pkts=" + String(packetCount) +
            " drop=" + String(saturatedPacketDrops()) +
            " bad=" + String(invalidPacketCount) +
+           " rej=" + String(poseRejectCounts[F_POSE_JUMP]) + "j/" +
+           String(poseRejectCounts[F_POSE_INVALID]) + "i" +
+           " age=" + String(static_cast<uint32_t>(lastPoseAgeMs) +
+                            (millis() - lastVioTime)) + "ms" +
            " pos=(" + String(robotX_ft, 1) + "," + String(robotY_ft, 1) + ")" +
            " hdg=" + String(robotHeading, 0) +
            " pt=" + String(routeIndex) + "/" + String(routeCount) +

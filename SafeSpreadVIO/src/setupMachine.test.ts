@@ -260,6 +260,82 @@ describe('setupReducer', () => {
   });
 });
 
+describe('resuming a faulted mission', () => {
+  function faultedState() {
+    return reduce(
+      enteredReadyState(),
+      { type: 'REQUEST_ARM' },
+      { type: 'ARM_ACKNOWLEDGED' },
+      { type: 'REQUEST_START' },
+      { type: 'START_ACKNOWLEDGED' },
+      { type: 'MISSION_FAULT', cause: 'pose timeout' },
+    );
+  }
+
+  it('keeps the rectangle and returns to readiness on the chosen pass', () => {
+    const faulted = faultedState();
+    const resumed = setupReducer(faulted, { type: 'RESUME_MISSION', passIndex: 3 });
+    expect(resumed.phase).toBe('readiness');
+    expect(resumed.resumePassIndex).toBe(3);
+    expect(resumed.rectangle).toBe(faulted.rectangle);
+    expect(resumed.fault).toBeNull();
+    expect(resumed.readiness).toEqual({ trackingNormal: false, poseStable: false, atStart: false });
+  });
+
+  it('lets the rover own the start-position check while resuming', () => {
+    const resumed = reduce(
+      faultedState(),
+      { type: 'RESUME_MISSION', passIndex: 2 },
+      { type: 'SET_READINESS', trackingNormal: true, poseStable: true, atStart: false },
+      { type: 'REQUEST_ARM' },
+    );
+    expect(resumed.phase).toBe('arming');
+
+    const fromStart = reduce(
+      faultedState(),
+      { type: 'RESUME_MISSION', passIndex: 0 },
+      { type: 'SET_READINESS', trackingNormal: true, poseStable: true, atStart: false },
+      { type: 'REQUEST_ARM' },
+    );
+    expect(fromStart.phase).toBe('readiness');
+    expect(fromStart.validationError).toMatch(/rectangle start/i);
+  });
+
+  it('refuses to resume mid-mission or without a rectangle', () => {
+    const running = setupReducer(
+      { ...enteredReadyState(), phase: 'running' },
+      { type: 'RESUME_MISSION', passIndex: 1 },
+    );
+    expect(running.phase).toBe('running');
+    expect(running.validationError).toMatch(/only available/i);
+
+    const noRectangle = setupReducer(
+      { ...initialSetupState(), phase: 'fault' },
+      { type: 'RESUME_MISSION', passIndex: 1 },
+    );
+    expect(noRectangle.phase).toBe('fault');
+    expect(noRectangle.validationError).toMatch(/rectangle/i);
+  });
+
+  it('returns to readiness when the rover refuses the Arm', () => {
+    const refused = reduce(
+      faultedState(),
+      { type: 'RESUME_MISSION', passIndex: 2 },
+      { type: 'SET_READINESS', trackingNormal: true, poseStable: true, atStart: false },
+      { type: 'REQUEST_ARM' },
+      { type: 'ARM_REFUSED', reason: 'not on that pass' },
+    );
+    expect(refused.phase).toBe('readiness');
+    expect(refused.validationError).toBe('not on that pass');
+    expect(refused.resumePassIndex).toBe(2);
+  });
+
+  it('drops the resume pass on a full Stop so the next mission starts over', () => {
+    const resumed = setupReducer(faultedState(), { type: 'RESUME_MISSION', passIndex: 4 });
+    expect(setupReducer(resumed, { type: 'STOP' }).resumePassIndex).toBe(0);
+  });
+});
+
 describe('MissionOperationGate', () => {
   it('invalidates stale async workflows when Stop begins', () => {
     const gate = new MissionOperationGate();

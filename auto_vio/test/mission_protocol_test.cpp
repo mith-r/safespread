@@ -170,6 +170,62 @@ int main() {
   assert(armedGate.acceptCommand({1, 7, 3}, 1000).state == S_ARMED);
   assert(armedGate.acceptCommand({4, 7, 4}, 1000).faultCode == F_ROUTE);
 
+  // Only the rover knows where a resumed pass begins. Refusing the ARM must be
+  // retryable -- the operator moves the rover and arms again -- not a fault.
+  MissionProtocol resume;
+  configure(resume, 4000);
+  assert(resume.acceptPose(pose(1, 20), 4000));
+  resume.setStartPointReached(false);
+  AckV2 refused = resume.acceptCommand({1, 7, 40}, 4000);
+  assert(refused.faultCode == F_START_POINT && resume.state() == S_CONFIGURED);
+  resume.setStartPointReached(true);
+  AckV2 armed = resume.acceptCommand({1, 7, 41}, 4000);
+  assert(armed.faultCode == F_NONE && resume.state() == S_ARMED);
+
+  // A stationary rover still reports a small, sign-flipping speed estimate.
+  // Sixty seconds of that noise must not look like a discontinuity: this is
+  // the field symptom the additive floors exist to stop.
+  MissionProtocol resting;
+  resting.setPwmReady(true);
+  configure(resting, 3000);
+  uint32_t restingNow = 3000;
+  for (uint32_t index = 0; index < 2000; ++index) {
+    const uint32_t age = 10 + (index % 3) * 5;
+    PoseV2 sample = pose(100 + index, age);
+    sample.speedFps = (index % 2) ? 0.22f : -0.21f;
+    sample.yawRateDps = (index % 2) ? 1.5f : -1.4f;
+    sample.x = ((index % 4) - 1.5f) * 0.01f;
+    sample.y = ((index % 3) - 1.0f) * 0.01f;
+    sample.heading = (index % 2) ? 0.4f : 359.6f;
+    restingNow += (index % 2) ? 16 : 17;
+    assert(resting.acceptPose(sample, restingNow));
+    assert(resting.lastPoseRejectFault() == F_NONE);
+  }
+
+  // Two packets landing inside the same millisecond are a BLE artefact, not a
+  // teleport; the capture-time floor keeps them usable.
+  PoseV2 bunchedFirst = pose(9000, 20);
+  bunchedFirst.speedFps = 0.3f;
+  assert(resting.acceptPose(bunchedFirst, restingNow + 20));
+  PoseV2 bunchedSecond = pose(9001, 20);
+  bunchedSecond.speedFps = 0.34f;
+  bunchedSecond.x = 0.02f;
+  assert(resting.acceptPose(bunchedSecond, restingNow + 20));
+  assert(resting.lastPoseRejectFault() == F_NONE);
+
+  // A genuine relocalisation snap is still a jump, and the freshness deadline
+  // is still a timeout.
+  PoseV2 snap = pose(9002, 20);
+  snap.x = 4.0f;
+  assert(!resting.acceptPose(snap, restingNow + 40));
+  assert(resting.lastPoseRejectFault() == F_POSE_JUMP);
+  PoseV2 lurch = pose(9003, 20);
+  lurch.speedFps = 4.0f;
+  assert(!resting.acceptPose(lurch, restingNow + 60));
+  assert(resting.lastPoseRejectFault() == F_POSE_JUMP);
+  assert(resting.poseFresh(restingNow + 40));
+  assert(!resting.poseFresh(restingNow + 20 + 231));
+
   std::printf("mission_protocol_test: all assertions passed\n");
   return 0;
 }

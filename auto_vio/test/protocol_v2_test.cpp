@@ -53,6 +53,18 @@ int main() {
   assert(buildRectangleV2(rectangle, builtRectangle, sizeof(builtRectangle)));
   assert(std::memcmp(builtRectangle, RECTANGLE_FIXTURE, sizeof(builtRectangle)) == 0);
 
+  // A resume carries the pass to start on in what used to be reserved space,
+  // so an old-style packet (zeroes) still means "drive the whole rectangle".
+  RectangleV2 resumed = {5, 4, 9, 20.0f, 8.0f, 4.0f, 6.0f, 3, 4};
+  uint8_t builtResume[RECTANGLE_SIZE];
+  assert(buildRectangleV2(resumed, builtResume, sizeof(builtResume)));
+  RectangleV2 parsedResume = {};
+  assert(parseRectangleV2(builtResume, sizeof(builtResume), parsedResume));
+  assert(parsedResume.startPassIndex == 4 && parsedResume.calibrationId == 3);
+  RectangleV2 parsedFixture = {};
+  assert(parseRectangleV2(RECTANGLE_FIXTURE, RECTANGLE_SIZE, parsedFixture));
+  assert(parsedFixture.startPassIndex == 0);
+
   CalibrationV2 calibration = {0, 4, 10, 3, -0.5f, 0.25f, 1};
   uint8_t builtCalibration[CALIBRATION_SIZE];
   assert(buildCalibrationV2(calibration, builtCalibration, sizeof(builtCalibration)));

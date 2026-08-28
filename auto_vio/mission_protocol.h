@@ -6,6 +6,15 @@
 #include "protocol_v2.h"
 #include "safety.h"
 
+// Why a pose was refused, with the numbers that refused it. Without these a
+// rejected stream is indistinguishable from a phone that stopped talking.
+struct PoseRejectDetail {
+  FaultCode fault;
+  float dtSeconds;
+  float measured;
+  float allowed;
+};
+
 class MissionProtocol {
  public:
   MissionState state() const { return state_; }
@@ -14,7 +23,8 @@ class MissionProtocol {
   uint16_t calibrationId() const { return calibrationId_; }
   uint32_t droppedPoses() const { return droppedPoses_; }
   uint32_t lastPoseReceivedAtMs() const { return poseReceivedAtMs_; }
-  FaultCode lastPoseRejectFault() const { return lastPoseRejectFault_; }
+  FaultCode lastPoseRejectFault() const { return lastPoseReject_.fault; }
+  const PoseRejectDetail &lastPoseReject() const { return lastPoseReject_; }
   bool lastCommandWasDuplicate() const { return lastCommandWasDuplicate_; }
   bool lastSetupWasDuplicate() const { return lastSetupWasDuplicate_; }
   const protocol_v2::RectangleV2 &rectangle() const { return rectangle_; }
@@ -23,6 +33,10 @@ class MissionProtocol {
   bool allowsLegacyDiagnostics() const { return state_ == S_IDLE; }
   bool allowsLegacyArm() const { return false; }
   void setPwmReady(bool ready) { pwmReady_ = ready; }
+  // Only the rover knows where a resumed pass begins, so only the rover can
+  // check the operator put it there. Refusing the ARM leaves the mission
+  // CONFIGURED so the rover can be moved and armed again.
+  void setStartPointReached(bool reached) { startPointReached_ = reached; }
 
   protocol_v2::AckV2 acceptCalibration(
       const protocol_v2::CalibrationV2 &message, uint32_t /* nowMs */) {
@@ -49,6 +63,7 @@ class MissionProtocol {
     hasPose_ = false;
     posePending_ = false;
     lastPoseSequence_ = 0;
+    lastPoseAgeMs_ = 0;
     droppedPoses_ = 0;
     fault_ = F_NONE;
     clearCommandCache();
@@ -90,7 +105,7 @@ class MissionProtocol {
   }
 
   bool acceptPose(const protocol_v2::PoseV2 &message, uint32_t receivedAtMs) {
-    lastPoseRejectFault_ = F_NONE;
+    lastPoseReject_ = {F_NONE, 0.0f, 0.0f, 0.0f};
     if (state_ != S_IDLE && state_ != S_CONFIGURED && state_ != S_ARMED && state_ != S_RUNNING) {
       return rejectPose(F_POSE_INVALID);
     }
@@ -109,29 +124,41 @@ class MissionProtocol {
       return rejectPose(F_POSE_INVALID);
     }
     if (hasPose_) {
-      const float dt = (receivedAtMs - poseReceivedAtMs_) / 1000.0f;
-      if (dt <= 0.0f) return rejectPose(F_POSE_INVALID);
-      if (std::fabs(message.speedFps - latestPose_.speedFps) / dt > MAX_ACCEL_FPS2) {
-        return rejectPose(F_POSE_JUMP);
+      // Measure continuity against when the frames were *captured*, not when
+      // their packets happened to land. BLE bunches writes, and an arrival gap
+      // of a millisecond between two frames taken 30 ms apart shrinks every
+      // allowance below the noise it is supposed to tolerate.
+      const float dt = frameIntervalSeconds(message, receivedAtMs);
+      // Every gate below carries an additive floor as well as a rate. A rover
+      // sitting still still reports a small, sign-flipping speed estimate, and
+      // a pure ratio turns that noise into a fault as dt shrinks.
+      const float speedStep = std::fabs(message.speedFps - latestPose_.speedFps);
+      const float allowedSpeedStep = MAX_ACCEL_FPS2 * dt + SPEED_NOISE_FPS;
+      if (speedStep > allowedSpeedStep) {
+        return rejectPose(F_POSE_JUMP, dt, speedStep, allowedSpeedStep);
       }
       const float dx = message.x - latestPose_.x;
       const float dy = message.y - latestPose_.y;
       const float allowedDistance =
           std::fmax(std::fabs(message.speedFps), std::fabs(latestPose_.speedFps)) * dt +
           POSITION_INNOVATION_FT;
-      if (std::sqrt(dx * dx + dy * dy) > allowedDistance) {
-        return rejectPose(F_POSE_JUMP);
+      const float displacement = std::sqrt(dx * dx + dy * dy);
+      if (displacement > allowedDistance) {
+        return rejectPose(F_POSE_JUMP, dt, displacement, allowedDistance);
       }
       const float headingDelta = std::fabs(wrappedAngleDiff(
           message.heading, latestPose_.heading));
       const float allowedHeading =
           std::fmax(std::fabs(message.yawRateDps), std::fabs(latestPose_.yawRateDps)) * dt +
           HEADING_INNOVATION_DEG;
-      if (headingDelta > allowedHeading) return rejectPose(F_POSE_JUMP);
+      if (headingDelta > allowedHeading) {
+        return rejectPose(F_POSE_JUMP, dt, headingDelta, allowedHeading);
+      }
     }
     if (posePending_) droppedPoses_++;
     latestPose_ = message;
     lastPoseSequence_ = message.sequence;
+    lastPoseAgeMs_ = message.ageMs;
     poseReceivedAtMs_ = receivedAtMs;
     hasPose_ = true;
     posePending_ = true;
@@ -202,6 +229,8 @@ class MissionProtocol {
         result = ack(message.epoch, message.commandId, F_POSE_TIMEOUT);
       } else if (!pwmReady_) {
         result = ack(message.epoch, message.commandId, F_PWM);
+      } else if (!startPointReached_) {
+        result = ack(message.epoch, message.commandId, F_START_POINT);
       } else {
         state_ = S_ARMED;
         result = ack(message.epoch, message.commandId, F_NONE);
@@ -265,6 +294,8 @@ class MissionProtocol {
   static constexpr float MAX_YAW_RATE_DPS = 180.0f;
   static constexpr float POSITION_INNOVATION_FT = 0.75f;
   static constexpr float HEADING_INNOVATION_DEG = 5.0f;
+  static constexpr float SPEED_NOISE_FPS = 0.5f;
+  static constexpr float MIN_FRAME_INTERVAL_S = 0.005f;
   static constexpr uint8_t COMMAND_CACHE_CAPACITY = 8;
   struct CommandCacheEntry {
     uint8_t opcode;
@@ -280,6 +311,7 @@ class MissionProtocol {
   bool hasAcceptedEpoch_ = false;
   uint16_t lastAcceptedEpoch_ = 0;
   bool pwmReady_ = false;
+  bool startPointReached_ = true;
   bool hasRectangle_ = false;
   protocol_v2::CalibrationV2 calibration_ = {};
   protocol_v2::RectangleV2 rectangle_ = {};
@@ -287,9 +319,10 @@ class MissionProtocol {
   bool posePending_ = false;
   protocol_v2::PoseV2 latestPose_ = {};
   uint32_t lastPoseSequence_ = 0;
+  uint32_t lastPoseAgeMs_ = 0;
   uint32_t poseReceivedAtMs_ = 0;
   uint32_t droppedPoses_ = 0;
-  FaultCode lastPoseRejectFault_ = F_NONE;
+  PoseRejectDetail lastPoseReject_ = {F_NONE, 0.0f, 0.0f, 0.0f};
   bool lastCommandWasDuplicate_ = false;
   bool lastSetupWasDuplicate_ = false;
   CommandCacheEntry commandCache_[COMMAND_CACHE_CAPACITY] = {};
@@ -313,9 +346,23 @@ class MissionProtocol {
     return result;
   }
 
-  bool rejectPose(FaultCode fault) {
-    lastPoseRejectFault_ = fault;
+  bool rejectPose(FaultCode fault, float dtSeconds = 0.0f, float measured = 0.0f,
+                  float allowed = 0.0f) {
+    lastPoseReject_ = {fault, dtSeconds, measured, allowed};
     return false;
+  }
+
+  // Capture-time gap between this pose and the last accepted one, floored so
+  // two packets that land in the same millisecond stay usable instead of
+  // dividing the allowances down to nothing.
+  float frameIntervalSeconds(
+      const protocol_v2::PoseV2 &message, uint32_t receivedAtMs) const {
+    const int64_t frameMs =
+        static_cast<int64_t>(receivedAtMs) - static_cast<int64_t>(message.ageMs);
+    const int64_t previousFrameMs =
+        static_cast<int64_t>(poseReceivedAtMs_) - static_cast<int64_t>(lastPoseAgeMs_);
+    const float seconds = (frameMs - previousFrameMs) / 1000.0f;
+    return seconds < MIN_FRAME_INTERVAL_S ? MIN_FRAME_INTERVAL_S : seconds;
   }
 
   static float wrappedAngleDiff(float a, float b) {

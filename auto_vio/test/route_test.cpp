@@ -341,6 +341,28 @@ int main() {
     assert(fallback.requirements.reversals > 0);
   }
 
+  // Passes are addressable so a faulted mission can resume on the one it was
+  // driving instead of re-covering the whole rectangle.
+  {
+    const float FIELD = 24.0f;
+    static RoutePoint plan[6000];
+    const int count = buildRoute(FIELD, FIELD, BAR, OVERLAP, RL, RR, plan, 6000);
+    const int lanes = laneCount(FIELD, BAR, OVERLAP);
+    assert(routePassCount(plan, count) == lanes);
+    assert(routePassStartIndex(plan, count, 0) == 0);
+    assert(routePassStartIndex(plan, count, lanes) == -1);
+    assert(routePassStartIndex(plan, count, -1) == -1);
+    for (int pass = 0; pass < lanes; ++pass) {
+      const int start = routePassStartIndex(plan, count, pass);
+      assert(start >= 0 && plan[start].spray);
+      assert(start == 0 || !plan[start - 1].spray);
+      if (pass > 0) assert(start > routePassStartIndex(plan, count, pass - 1));
+      // Resuming lands the rover on the lane it is about to spray.
+      assert(std::fabs(plan[start].x - laneCenterX(pass, BAR, OVERLAP)) < 0.05f);
+      assert(routePassIndexAt(plan, count, start) == pass);
+    }
+  }
+
   printf("route_test: all assertions passed\n");
   return 0;
 }

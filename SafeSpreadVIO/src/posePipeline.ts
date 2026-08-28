@@ -54,6 +54,23 @@ const MAX_SPEED_FPS = 8;
 const MAX_ACCELERATION_FPS2 = 15;
 const MAX_YAW_RATE_DPS = 180;
 const INNOVATION_ALLOWANCE_FT = 0.75;
+// The position and innovation gates below already carry an additive floor; the
+// acceleration gate needs one too. Standing still, the velocity estimate is
+// noise, and dividing noise by a 16 ms frame interval clears 15 ft/s^2 without
+// the rover having moved at all.
+const SPEED_NOISE_FPS = 0.5;
+const MIN_FRAME_INTERVAL_S = 0.005;
+// Velocity from two frames 16 ms apart is mostly position noise amplified 60x.
+// Only measure across a baseline long enough to contain real motion, and call
+// anything under the deadband a standstill.
+const MOTION_SAMPLE_LIMIT = 10;
+const MIN_VELOCITY_BASELINE_S = 0.05;
+const SPEED_DEADBAND_FPS = 0.1;
+// A frame the motion gates refuse is a hiccup, not a loss of tracking, so it
+// must not throw away the readiness history the operator is waiting on.
+const HARD_REJECTS: ReadonlySet<PoseRejectReason> = new Set<PoseRejectReason>([
+  'tracking', 'calibration', 'nonFinite', 'sequence', 'timestamp',
+]);
 const READY_DURATION_MS = 2000;
 const READY_MIN_SAMPLES = 30;
 const READY_MAX_AGE_MS = 150;
@@ -89,15 +106,23 @@ function estimateMotion(samples: MotionSample[]) {
   const vx: number[] = [];
   const vy: number[] = [];
   const yaw: number[] = [];
+  const add = (from: MotionSample, to: MotionSample) => {
+    const seconds = (to.frameTimestampMs - from.frameTimestampMs) / 1000;
+    if (seconds <= 0) return;
+    vx.push((to.rover.x - from.rover.x) / seconds);
+    vy.push((to.rover.y - from.rover.y) / seconds);
+    yaw.push(wrappedHeadingDelta(to.rover.heading, from.rover.heading) / seconds);
+  };
   for (let from = 0; from < samples.length - 1; from += 1) {
     for (let to = from + 1; to < samples.length; to += 1) {
       const seconds = (samples[to].frameTimestampMs - samples[from].frameTimestampMs) / 1000;
-      if (seconds <= 0) continue;
-      vx.push((samples[to].rover.x - samples[from].rover.x) / seconds);
-      vy.push((samples[to].rover.y - samples[from].rover.y) / seconds);
-      yaw.push(wrappedHeadingDelta(samples[to].rover.heading, samples[from].rover.heading) / seconds);
+      if (seconds < MIN_VELOCITY_BASELINE_S) continue;
+      add(samples[from], samples[to]);
     }
   }
+  // For the first frames after a reset nothing spans the baseline yet. Report a
+  // standstill rather than a velocity made entirely of position noise; the
+  // arming window demands two still seconds before any of this drives a wheel.
   return { vx: median(vx), vy: median(vy), yawRateDps: median(yaw) };
 }
 
@@ -150,16 +175,26 @@ export class PosePipeline {
     const camera = { x: event.x, y: event.y, heading: normalizeHeading(event.heading) };
     const rover = cameraToRover(camera, this.calibration);
     const sprayBar = roverToSprayBar(rover, this.calibration);
-    const candidates = [...this.motionSamples, { frameTimestampMs: event.frameTimestampMs, rover }].slice(-5);
+    const candidates = [...this.motionSamples, { frameTimestampMs: event.frameTimestampMs, rover }]
+      .slice(-MOTION_SAMPLE_LIMIT);
     const motion = estimateMotion(candidates);
-    const motionMagnitudeFps = Math.hypot(motion.vx, motion.vy);
+    const rawMagnitudeFps = Math.hypot(motion.vx, motion.vy);
+    const standstill = rawMagnitudeFps < SPEED_DEADBAND_FPS;
+    const motionMagnitudeFps = standstill ? 0 : rawMagnitudeFps;
+    const velocityX = standstill ? 0 : motion.vx;
+    const velocityY = standstill ? 0 : motion.vy;
     if (motionMagnitudeFps > MAX_SPEED_FPS) return this.reject('speed');
     if (Math.abs(motion.yawRateDps) > MAX_YAW_RATE_DPS) return this.reject('yawRate');
 
     if (this.lastAccepted) {
-      const seconds = (event.frameTimestampMs - this.lastAccepted.frameTimestampMs) / 1000;
-      const acceleration = Math.abs(motionMagnitudeFps - this.lastMotionMagnitudeFps) / seconds;
-      if (acceleration > MAX_ACCELERATION_FPS2) return this.reject('acceleration');
+      const seconds = Math.max(
+        (event.frameTimestampMs - this.lastAccepted.frameTimestampMs) / 1000,
+        MIN_FRAME_INTERVAL_S,
+      );
+      const speedStep = Math.abs(motionMagnitudeFps - this.lastMotionMagnitudeFps);
+      if (speedStep > MAX_ACCELERATION_FPS2 * seconds + SPEED_NOISE_FPS) {
+        return this.reject('acceleration');
+      }
 
       const displacement = Math.hypot(rover.x - this.lastAccepted.rover.x, rover.y - this.lastAccepted.rover.y);
       const allowed = INNOVATION_ALLOWANCE_FT + this.lastMotionMagnitudeFps * seconds;
@@ -168,10 +203,10 @@ export class PosePipeline {
 
     const forwardX = Math.sin((rover.heading * Math.PI) / 180);
     const forwardY = Math.cos((rover.heading * Math.PI) / 180);
-    const speedFps = motion.vx * forwardX + motion.vy * forwardY;
-    const courseDeg = motionMagnitudeFps < 0.05
+    const speedFps = velocityX * forwardX + velocityY * forwardY;
+    const courseDeg = standstill
       ? null
-      : normalizeHeading(Math.atan2(motion.vx, motion.vy) * 180 / Math.PI);
+      : normalizeHeading(Math.atan2(velocityX, velocityY) * 180 / Math.PI);
     const pose: ValidatedPose = {
       sequence: event.sequence,
       frameTimestampMs: event.frameTimestampMs,
@@ -222,7 +257,7 @@ export class PosePipeline {
   }
 
   private reject(reason: PoseRejectReason): PoseDecision {
-    this.readySamples = [];
+    if (HARD_REJECTS.has(reason)) this.readySamples = [];
     return { ok: false, reason };
   }
 }

@@ -23,6 +23,10 @@ export interface RectangleV2 {
   startClearFt: number;
   endClearFt: number;
   calibrationId: number;
+  /** Sprayed pass to begin on, counted in route order from zero. Omit or pass
+   *  zero to drive the whole rectangle; anything else resumes a mission that
+   *  faulted part-way through. */
+  startPassIndex?: number;
 }
 
 export interface CalibrationV2 {
@@ -204,6 +208,7 @@ export function buildRectangleV2(value: RectangleV2): Uint8Array {
   view.setFloat32(18, nonnegative(value.startClearFt, 'startClearFt'), true);
   view.setFloat32(22, nonnegative(value.endClearFt, 'endClearFt'), true);
   view.setUint16(26, uint(value.calibrationId, 0xffff, 'calibrationId'), true);
+  view.setUint16(28, uint(value.startPassIndex ?? 0, 0xffff, 'startPassIndex'), true);
   return finalizePacket(bytes);
 }
 

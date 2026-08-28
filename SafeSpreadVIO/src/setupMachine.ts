@@ -43,6 +43,11 @@ export interface SetupState {
   wet: boolean;
   loggingReady: boolean;
   readiness: SetupReadiness;
+  // Sprayed pass this mission begins on, counted in route order from zero. A
+  // fault used to cost the whole rectangle: the operator can now re-drive only
+  // the passes that are left. The rover checks the rover is actually standing
+  // there before it will arm, because only the rover knows the route order.
+  resumePassIndex: number;
   validationError: string | null;
   warning: string | null;
   fault: string | null;
@@ -80,6 +85,8 @@ export type SetupAction =
   | { type: 'START_ACKNOWLEDGED' }
   | { type: 'MISSION_COMPLETE' }
   | { type: 'MISSION_FAULT'; cause: string }
+  | { type: 'RESUME_MISSION'; passIndex: number }
+  | { type: 'ARM_REFUSED'; reason: string }
   | { type: 'ACK_TIMEOUT'; operation: string }
   | { type: 'STOP' };
 
@@ -127,6 +134,7 @@ export function initialSetupState(): SetupState {
     wet: false,
     loggingReady: false,
     readiness: { ...NOT_READY },
+    resumePassIndex: 0,
     validationError: null,
     warning: null,
     fault: null,
@@ -153,7 +161,10 @@ function canArm(state: SetupState): string | null {
   if (!state.rectangle) return 'Define and confirm the rectangle before arming.';
   if (!state.readiness.trackingNormal) return 'ARKit tracking must be normal before arming.';
   if (!state.readiness.poseStable) return 'Wait for a stable pose before arming.';
-  if (!state.readiness.atStart) {
+  // A resumed mission starts on a lane in the middle of the rectangle, not at
+  // the origin this check knows about; the rover refuses the Arm itself if the
+  // operator has not put it on that lane.
+  if (!state.readiness.atStart && state.resumePassIndex === 0) {
     return state.rectangleMode === 'walked'
       ? 'Return the rover to Corner A before arming.'
       : 'Move the rover to the rectangle start before arming.';
@@ -329,6 +340,34 @@ export function setupReducer(state: SetupState, action: SetupAction): SetupState
 
     case 'MISSION_FAULT':
       return { ...state, phase: 'fault', fault: action.cause, validationError: null };
+
+    case 'RESUME_MISSION': {
+      if (state.phase !== 'fault' && state.phase !== 'complete') {
+        return fail(state, 'Resume is only available after a fault or completion.');
+      }
+      if (!state.rectangle) return fail(state, 'The rectangle is no longer defined; start over.');
+      if (!Number.isInteger(action.passIndex) || action.passIndex < 0) {
+        return fail(state, 'Choose which pass to resume from.');
+      }
+      // The rectangle is kept exactly as it was. Re-entering it would anchor a
+      // new origin on wherever the rover now sits, and every remaining pass
+      // would be laid down in the wrong place.
+      return {
+        ...state,
+        phase: 'readiness',
+        resumePassIndex: action.passIndex,
+        readiness: { ...NOT_READY },
+        fault: null,
+        validationError: null,
+      };
+    }
+
+    // The rover can refuse an Arm without faulting -- it stays configured, so
+    // the operator fixes what it complained about and arms again.
+    case 'ARM_REFUSED':
+      return state.phase === 'arming'
+        ? { ...state, phase: 'readiness', validationError: action.reason }
+        : fail(state, action.reason);
 
     case 'ACK_TIMEOUT':
       return {

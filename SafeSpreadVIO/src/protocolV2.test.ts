@@ -87,6 +87,32 @@ describe('protocol v2 builders', () => {
     expect(hex(command)).toBe('2143020804000b00000059c1');
   });
 
+  it('carries the resume pass in the rectangle packet without moving anything else', () => {
+    const base = {
+      flags: 0b101,
+      epoch: 4,
+      commandId: 9,
+      mFt: 20,
+      nFt: 8,
+      startClearFt: 4,
+      endClearFt: 6,
+      calibrationId: 3,
+    };
+    const fromStart = buildRectangleV2(base);
+    const resumed = buildRectangleV2({ ...base, startPassIndex: 4 });
+    expect(resumed.length).toBe(fromStart.length);
+    // Everything before the formerly reserved field is byte-identical, so a
+    // rover that ignores the field still reads the same rectangle.
+    expect(hex(resumed.subarray(0, 28))).toBe(hex(fromStart.subarray(0, 28)));
+    expect(Array.from(resumed.subarray(28, 30))).toEqual([4, 0]);
+    const view = new DataView(resumed.buffer, resumed.byteOffset, resumed.byteLength);
+    expect(view.getUint16(30, true)).toBe(crc16Ccitt(resumed.subarray(0, 30)));
+    // An omitted field is the old wire format exactly.
+    expect(hex(buildRectangleV2({ ...base, startPassIndex: 0 }))).toBe(hex(fromStart));
+    expect(() => buildRectangleV2({ ...base, startPassIndex: -1 })).toThrow(RangeError);
+    expect(() => buildRectangleV2({ ...base, startPassIndex: 0x10000 })).toThrow(RangeError);
+  });
+
   it('rejects invalid identifiers, geometry, headings, and non-finite values', () => {
     expect(() => buildPoseV2({ ...pose, epoch: -1 })).toThrow(RangeError);
     expect(() => buildPoseV2({ ...pose, flags: 8 })).toThrow(RangeError);

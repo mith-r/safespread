@@ -41,6 +41,19 @@ class MissionOperationCancelled extends Error {
   }
 }
 
+/** Firmware fault 13: the rover is not standing on the pass it was asked to
+ *  resume from. The mission stays configured, so the operator moves the rover
+ *  and arms again rather than starting over. */
+export const FAULT_START_POINT = 13;
+
+/** A refusal the operator can act on, as opposed to a mission fault. The
+ *  client keeps its state so the same command can simply be retried. */
+export class MissionCommandRefused extends Error {
+  constructor(readonly faultCode: number, message: string) {
+    super(message);
+  }
+}
+
 export class MissionControl {
   private currentState: MissionClientState = 'idle';
   private nextCommandId = 1;
@@ -75,7 +88,13 @@ export class MissionControl {
     return this.currentState;
   }
 
-  async configure(definition: RectangleDefinition, calibration: CalibrationWire): Promise<AckV2> {
+  /** `startPassIndex` resumes a faulted mission on a later pass; zero drives
+   *  the whole rectangle. The rover validates it against the plan it builds. */
+  async configure(
+    definition: RectangleDefinition,
+    calibration: CalibrationWire,
+    startPassIndex = 0,
+  ): Promise<AckV2> {
     if (this.currentState !== 'idle') throw new Error('mission must be idle before configure');
     return this.exclusive(async (generation) => {
       this.calibrationId = calibration.id;
@@ -107,6 +126,7 @@ export class MissionControl {
         startClearFt: definition.startClearFt,
         endClearFt: definition.endClearFt,
         calibrationId: calibration.id,
+        startPassIndex,
       }), rectangleCommandId, generation);
       this.requireAck(rectangleAck, [1], calibration.id);
       this.currentState = 'configured';
@@ -160,7 +180,7 @@ export class MissionControl {
   async arm(): Promise<AckV2> {
     if (this.currentState !== 'configured') throw new Error('mission must be configured before arm');
     if (!this.hasFreshPose()) throw new Error('a fresh valid pose is required before arm');
-    return this.command(1, [2], 'armed');
+    return this.command(1, [2], 'armed', true, [FAULT_START_POINT]);
   }
 
   async start(): Promise<AckV2> {
@@ -198,6 +218,7 @@ export class MissionControl {
     expectedStates: number[],
     nextState: MissionClientState,
     validateCalibration = true,
+    retryableFaults: number[] = [],
   ): Promise<AckV2> {
     return this.exclusive(async (generation) => {
       const commandId = this.takeCommandId();
@@ -206,7 +227,8 @@ export class MissionControl {
         commandId,
         generation,
       );
-      this.requireAck(ack, expectedStates, validateCalibration ? this.calibrationId : null);
+      this.requireAck(ack, expectedStates, validateCalibration ? this.calibrationId : null,
+                      retryableFaults);
       this.currentState = nextState;
       return ack;
     });
@@ -221,7 +243,10 @@ export class MissionControl {
       this.ensureCurrent(generation);
       return result;
     } catch (error) {
-      if (!(error instanceof MissionOperationCancelled)) this.currentState = 'fault';
+      if (!(error instanceof MissionOperationCancelled) &&
+          !(error instanceof MissionCommandRefused)) {
+        this.currentState = 'fault';
+      }
       throw error;
     } finally {
       this.busy = false;
@@ -316,7 +341,18 @@ export class MissionControl {
     });
   }
 
-  private requireAck(ack: AckV2, states: number[], calibrationId: number | null): void {
+  private requireAck(
+    ack: AckV2,
+    states: number[],
+    calibrationId: number | null,
+    retryableFaults: number[] = [],
+  ): void {
+    if (ack.state !== 5 && retryableFaults.includes(ack.faultCode)) {
+      throw new MissionCommandRefused(
+        ack.faultCode,
+        'The rover is not on the pass you asked to resume from. Move it onto that lane, facing along it, and arm again.',
+      );
+    }
     if (ack.state === 5 || ack.faultCode !== 0) throw new Error(`firmware fault ${ack.faultCode}`);
     if (!states.includes(ack.state)) throw new Error(`unexpected acknowledgement state ${ack.state}`);
     if (calibrationId !== null && ack.calibrationId !== calibrationId) {

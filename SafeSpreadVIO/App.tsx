@@ -6,7 +6,7 @@ import { SafeSpreadBLE } from './src/ble';
 import { CalibrationRecord, createCalibration } from './src/calibration';
 import { loadCalibration, saveCalibration } from './src/calibrationStore';
 import { LatestPoseSender } from './src/latestPoseSender';
-import { MissionControl } from './src/missionControl';
+import { MissionCommandRefused, MissionControl } from './src/missionControl';
 import { missionJsonlToCsv } from './src/missionCsv';
 import {
   createFileLogSink,
@@ -43,6 +43,7 @@ function faultName(code: number): string {
     'none', 'BLE disconnected', 'pose timeout', 'invalid pose', 'pose jump',
     'PWM controller', 'I2C controller', 'no-motion stall', 'wrong direction',
     'tracking degraded', 'route invalid', 'calibration mismatch', 'headland insufficient',
+    'not on the resumed pass',
   ];
   return names[code] ?? `firmware fault ${code}`;
 }
@@ -68,7 +69,27 @@ export default function App() {
   setupRef.current = setup;
   const [calibration, setCalibration] = useState<CalibrationRecord | null>(null);
   const mountCalibration = calibration ?? DEFAULT_MOUNT_CALIBRATION;
-  const vio = useVIOPose(mountCalibration);
+  // Every refused pose is a pose the rover never sees. Record them -- the first
+  // of each cause immediately, then once a second per cause so a long tracking
+  // outage annotates the log instead of filling it.
+  const rejectLoggedAtRef = useRef<Partial<Record<string, number>>>({});
+  const vio = useVIOPose(mountCalibration, (rejection) => {
+    const now = Date.now();
+    const previous = rejectLoggedAtRef.current[rejection.reason];
+    if (previous !== undefined && now - previous < 1000) return;
+    rejectLoggedAtRef.current[rejection.reason] = now;
+    recordLog({
+      type: 'pose_reject',
+      phoneMs: now,
+      sequence: rejection.sequence,
+      reason: rejection.reason,
+      frameTimestampMs: rejection.frameTimestampMs,
+      trackingState: rejection.trackingState,
+      trackingReason: rejection.trackingReason,
+      reasonCount: rejection.count,
+      rejectedTotal: rejection.total,
+    });
+  });
   const trackingOkRef = useRef(vio.trackingOk);
   trackingOkRef.current = vio.trackingOk;
   const [busy, setBusy] = useState(false);
@@ -77,6 +98,12 @@ export default function App() {
   const [recentLogs, setRecentLogs] = useState<MissionLogFile[]>([]);
   const [telemetry, setTelemetry] = useState<TelemetryV2 | null>(null);
   const telemetryRef = useRef<TelemetryV2 | null>(null);
+  // Which sprayed pass the rover is on, counted from the spray transitions in
+  // its own telemetry. The rover reports route points, not passes, and the pass
+  // is what an operator resumes from.
+  const [passesStarted, setPassesStarted] = useState(0);
+  const passesStartedRef = useRef(0);
+  const sprayingRef = useRef(false);
   const [path, setPath] = useState<PathPoint[]>([]);
   const [logName, setLogName] = useState<string | null>(null);
   const [faultDumpUri, setFaultDumpUri] = useState<string | null>(null);
@@ -364,6 +391,12 @@ export default function App() {
     const removeTelemetry = ble.subscribeTelemetry((next) => {
       telemetryRef.current = next;
       setTelemetry(next);
+      const spraying = Boolean(next.flags & 1);
+      if (spraying && !sprayingRef.current) {
+        passesStartedRef.current += 1;
+        setPassesStarted(passesStartedRef.current);
+      }
+      sprayingRef.current = spraying;
       const poseRecord = poseBySequenceRef.current.get(next.consumedPoseSequence) ?? {};
       recordLog({
         ...poseRecord,
@@ -679,11 +712,15 @@ export default function App() {
       dispatch({ type: 'REQUEST_ARM' });
       if (!setup.rectangle) throw new Error('Rectangle is missing.');
       const wire = calibration ?? DEFAULT_MOUNT_CALIBRATION;
-      await control.configure(setup.rectangle, wire);
+      await control.configure(setup.rectangle, wire, setup.resumePassIndex);
       operationGateRef.current.assertCurrent(operation.generation);
       rectangleConfiguredRef.current = true;
       const currentReadiness = setupRef.current.readiness;
-      if (!trackingOkRef.current || !currentReadiness.poseStable || !currentReadiness.atStart) {
+      // A resumed mission starts on a lane in the middle of the rectangle, so
+      // the origin check does not apply; the rover refuses the Arm itself if
+      // the operator has not put it on that pass.
+      const startVerified = currentReadiness.atStart || setup.resumePassIndex > 0;
+      if (!trackingOkRef.current || !currentReadiness.poseStable || !startVerified) {
         throw new Error('Readiness changed during Configure; Stop and return to the rectangle start.');
       }
       await control.arm();
@@ -693,9 +730,19 @@ export default function App() {
     } catch (error) {
       if (!operationGateRef.current.isCurrent(operation.generation)) return;
       const message = error instanceof Error ? error.message : String(error);
-      if (/ACK timeout/i.test(message)) dispatch({ type: 'ACK_TIMEOUT', operation: 'Arm' });
-      else dispatch({ type: 'MISSION_FAULT', cause: message });
-      void handleMissionFault(message);
+      // A refused Arm is not a fault: the rover stays configured and the
+      // operator moves it onto the pass and tries again.
+      if (error instanceof MissionCommandRefused) {
+        dispatch({ type: 'ARM_REFUSED', reason: message });
+        setOperationError(message);
+        recordLog({ type: 'arm_refused', phoneMs: Date.now(), fault: error.faultCode, state: 'CONFIGURED' });
+      } else if (/ACK timeout/i.test(message)) {
+        dispatch({ type: 'ACK_TIMEOUT', operation: 'Arm' });
+        void handleMissionFault(message);
+      } else {
+        dispatch({ type: 'MISSION_FAULT', cause: message });
+        void handleMissionFault(message);
+      }
     } finally {
       finishMissionOperation(operation.generation, operation.settle);
     }
@@ -725,6 +772,17 @@ export default function App() {
   }
 
   async function onStop() {
+    await stopMission(null);
+  }
+
+  /** Stop the rover but keep the rectangle, so the remaining passes are laid
+   *  down in the same place. Re-defining the rectangle would anchor a new
+   *  origin wherever the rover happens to be standing now. */
+  async function onResume(passIndex: number) {
+    await stopMission(passIndex);
+  }
+
+  async function stopMission(resumePassIndex: number | null) {
     const pendingOperation = cancelActiveMissionOperation();
     setBusy(true);
     setOperationError(null);
@@ -737,11 +795,15 @@ export default function App() {
     } finally {
       await pendingOperation;
       activeOperationSettledRef.current = null;
-      dispatch({ type: 'STOP' });
+      if (resumePassIndex === null) dispatch({ type: 'STOP' });
+      else dispatch({ type: 'RESUME_MISSION', passIndex: resumePassIndex });
       await releaseMissionResources(true);
       setTelemetry(null);
       telemetryRef.current = null;
       setPath([]);
+      passesStartedRef.current = 0;
+      setPassesStarted(0);
+      sprayingRef.current = false;
       setBusy(false);
     }
   }
@@ -764,9 +826,15 @@ export default function App() {
     }
   }
 
-  const trackingDetail = vio.trackingState === 'limited'
+  const trackingBase = vio.trackingState === 'limited'
     ? `tracking limited: ${vio.trackingReason}`
     : `tracking ${vio.trackingState}`;
+  // Say when poses are being dropped and why. A silent pose stream and a
+  // rejected pose stream both end as a rover-side pose timeout, and only this
+  // line tells the operator which one they have.
+  const trackingDetail = vio.rejectSummary.total === 0
+    ? trackingBase
+    : `${trackingBase} · ${vio.rejectSummary.total} poses dropped (last: ${vio.rejectSummary.lastReason})`;
   const showMission = Boolean(setup.rectangle && ['running', 'complete', 'fault'].includes(setup.phase));
 
   if (showMission && setup.rectangle) {
@@ -782,7 +850,9 @@ export default function App() {
         logName={logName}
         faultDumpReady={Boolean(faultDumpUri)}
         busy={busy}
+        currentPassIndex={setup.resumePassIndex + Math.max(0, passesStarted - 1)}
         onStop={onStop}
+        onResume={onResume}
         onDownloadFault={async () => {
           if (faultDumpUri) await exportMissionLog(faultDumpUri);
         }}

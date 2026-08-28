@@ -26,6 +26,9 @@ enum FaultCode : uint8_t {
   F_ROUTE = 10,
   F_CALIBRATION = 11,
   F_HEADLAND = 12,
+  // Not a mission fault: the rover refuses to arm because it is not standing
+  // on the pass the operator asked to resume from. Move it and arm again.
+  F_START_POINT = 13,
 };
 
 struct SafetyInput {

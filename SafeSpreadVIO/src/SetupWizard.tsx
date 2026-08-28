@@ -298,7 +298,14 @@ export default function SetupWizard(props: SetupWizardProps) {
           <Text style={styles.cardTitle}>4. Readiness and acknowledgements</Text>
           <Text style={styles.check}>{state.readiness.trackingNormal ? '✓' : '○'} Tracking normal</Text>
           <Text style={styles.check}>{state.readiness.poseStable ? '✓' : '○'} Stable 2-second pose window — {props.readinessReason}</Text>
-          <Text style={styles.check}>{state.readiness.atStart ? '✓' : '○'} Rover at rectangle start{state.rectangleMode === 'walked' ? ' / Corner A' : ''}</Text>
+          {state.resumePassIndex > 0 ? (
+            <Text style={styles.check}>
+              ↻ Resuming on pass {state.resumePassIndex + 1}. Put the rover on that lane facing
+              along it — the rover checks the spot itself and refuses to arm until it is there.
+            </Text>
+          ) : (
+            <Text style={styles.check}>{state.readiness.atStart ? '✓' : '○'} Rover at rectangle start{state.rectangleMode === 'walked' ? ' / Corner A' : ''}</Text>
+          )}
           <Text style={styles.check}>{state.calibrationStatus === 'ready' ? '✓' : state.wet ? '✕' : '△'} Calibration {state.calibrationStatus}</Text>
           <Text style={styles.check}>{state.loggingReady ? '✓ Mission log ready' : state.wet ? '✕ Mission log required for wet use' : '△ Dry run may continue without a log'}</Text>
           {state.phase === 'readiness' ? <Button label="Configure and Arm" disabled={props.busy} onPress={() => void props.onArm()} /> : null}

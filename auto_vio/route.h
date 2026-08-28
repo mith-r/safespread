@@ -177,6 +177,40 @@ inline int emitTurn(RoutePoint *out, int maxOut, const TurnPlan &p,
   return n;
 }
 
+/** How many sprayed passes the plan contains, counted in the order they are
+ *  driven rather than by lane number -- a forward-only plan visits lanes out
+ *  of order, and what an operator resumes is the pass, not the lane. */
+inline int routePassCount(const RoutePoint *route, int count) {
+  int passes = 0;
+  for (int i = 0; i < count; ++i) {
+    if (route[i].spray && (i == 0 || !route[i - 1].spray)) passes++;
+  }
+  return passes;
+}
+
+/** First point of the given sprayed pass, or -1 when the plan has no such
+ *  pass. Resuming a faulted mission starts here instead of at point zero. */
+inline int routePassStartIndex(const RoutePoint *route, int count, int pass) {
+  if (pass < 0) return -1;
+  int seen = 0;
+  for (int i = 0; i < count; ++i) {
+    if (!route[i].spray || (i > 0 && route[i - 1].spray)) continue;
+    if (seen == pass) return i;
+    seen++;
+  }
+  return -1;
+}
+
+/** Which sprayed pass a route index sits on, in the same route order. Used to
+ *  report where a resumed mission actually starts. */
+inline int routePassIndexAt(const RoutePoint *route, int count, int index) {
+  int pass = -1;
+  for (int i = 0; i < count && i <= index; ++i) {
+    if (route[i].spray && (i == 0 || !route[i - 1].spray)) pass++;
+  }
+  return pass < 0 ? 0 : pass;
+}
+
 /** Last point of the run the rover is currently driving, i.e. the next cusp
  *  or the end of the plan. */
 inline int segmentEndIndex(const RoutePoint *route, int count, int fromIndex) {
