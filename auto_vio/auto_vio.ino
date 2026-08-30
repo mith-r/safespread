@@ -663,7 +663,15 @@ void serviceSafetyEvents() {
     routeCount = 0;
     routeIndex = 0;
     resetCourse();
-    if (shouldAck) sendAck(ack);
+    if (shouldAck) {
+      // STOP commands bypass the normal BLE queue so they remain fail-safe.
+      // Preserve the protocol-v2 capability marker on that fast path; the
+      // phone uses an epoch-zero STOP as its harmless compatibility probe.
+      if (stopEpoch == 0 && ack.faultCode == F_NONE) {
+        ack.calibrationId = protocol_v2::HARDENED_FIRMWARE_CAPABILITY_ID;
+      }
+      sendAck(ack);
+    }
     bleLog(">>> Mission stopped.");
   }
 
